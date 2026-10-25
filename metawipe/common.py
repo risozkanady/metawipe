@@ -15,6 +15,13 @@ class WipeError(Exception):
 class Context:
     password: str | None = None
     warn: Callable[[str], None] = field(default=lambda msg: print(f"warn   {msg}", file=sys.stderr))
+    full: bool = False
+    residue: list = field(default_factory=list)
+
+    def leftover(self, msg: str) -> None:
+        """Something identifying that this run could not remove (full mode reports the file as incomplete)."""
+        self.residue.append(msg)
+        self.warn(msg)
 
 
 # Orientation is not identifying and dropping it would turn portrait photos sideways, so image

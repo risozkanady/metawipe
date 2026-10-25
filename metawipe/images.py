@@ -295,3 +295,10 @@ jpeg = _bytes_handler(clean_jpeg)
 png = _bytes_handler(clean_png)
 webp = _bytes_handler(clean_webp)
 tiff = _bytes_handler(clean_tiff)
+
+
+# By extension, for pictures embedded in other documents.
+BY_EXT = {
+    ".jpg": clean_jpeg, ".jpeg": clean_jpeg, ".jpe": clean_jpeg,
+    ".png": clean_png, ".apng": clean_png, ".webp": clean_webp, ".tif": clean_tiff, ".tiff": clean_tiff,
+}
