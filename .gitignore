@@ -1,2 +1,5 @@
 __pycache__/
 *.clean.*
+.venv/
+*.egg-info/
+build/

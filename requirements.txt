@@ -1,2 +1,1 @@
-pillow
-pypdf
+pypdf[crypto]>=5.0
