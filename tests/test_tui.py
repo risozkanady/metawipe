@@ -54,6 +54,21 @@ class TuiTests(unittest.TestCase):
             self.assertNotIn(SECRET, (out / "a.png").read_bytes())
             self.assertIn(SECRET, (src / "a.png").read_bytes())
 
+    def test_help_screen_opens_and_closes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            async def scenario():
+                app = MetawipeApp(Path(tmp))
+                async with app.run_test(size=(140, 45)) as pilot:
+                    await pilot.pause(0.3)
+                    await pilot.press("f1")
+                    await pilot.pause(0.3)
+                    self.assertEqual(type(app.screen).__name__, "HelpScreen")
+                    await pilot.press("escape")
+                    await pilot.pause(0.3)
+                    self.assertEqual(type(app.screen).__name__, "Screen")
+
+            asyncio.run(scenario())
+
     def test_nothing_marked_does_not_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             async def scenario():

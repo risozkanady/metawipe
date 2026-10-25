@@ -9,7 +9,7 @@ from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, DirectoryTree, Footer, Header, Input, Label, RichLog, Select, Static, Switch
 
@@ -72,6 +72,56 @@ class Confirm(ModalScreen[bool]):
         self.dismiss(value)
 
 
+HELP = """[b]metawipe[/b] - removes identifying metadata (location, device, author, dates, ...) from files.
+
+[b]Screen[/b]
+  Left   file tree. [green]\\[x][/] = marked, [dim]\\[ ][/] = not marked, dimmed names are types metawipe cannot clean.
+  Right  top: [b]Metadata preview[/b] of the highlighted file (what it carries now: Make/Model, GPS, authors,
+         comment authors, thumbnails, embedded pictures, video location, ...). A folder shows how many files it holds.
+         middle: [b]options[/b].  bottom: [b]Results[/b] log.
+
+[b]Keys[/b]
+  up/down, Enter  move, open/close folders        m or space  mark / unmark file or folder (folders: recursive)
+  a  mark all supported files in this folder      c  clear all marks
+  r  run on everything marked                     f  toggle full scrub
+  F1 or ?  this help                              q  quit            Tab  jump between tree and options
+
+[b]Options[/b]
+  [b]Full scrub (--full)[/b]  on: also anonymise authors/dates of comments and tracked changes, clean pictures embedded in
+      documents, drop customXml/printer settings, remove encoder strings (x264/x265) from videos, set file time to 1980.
+      Files where something identifying had to stay are reported INCOMPLETE.
+  [b]Output[/b]  copy next to the original (NAME.clean.EXT)  |  copy into an output folder (same folder structure)  |
+      overwrite the originals (asks first - cannot be undone).
+  [b]Overwrite existing (-f)[/b]  replace output files that already exist (otherwise they are left alone and reported).
+
+[b]Results[/b]
+  clean  file -> destination        error  why it failed        skip  not a file metawipe handles
+  "still carries: ..."  what the cleaned copy still has (so you can see what a normal run leaves behind)
+  warn   something worth knowing (e.g. signatures removed, OLE embeddings left)
+
+[b]Supported[/b]  jpg png apng webp tiff | heic heif avif | mov mp4 m4v 3gp (needs ffmpeg) | pdf | docx xlsx pptx and
+variants | odt ods odp and variants.   [b]Never touched[/b]  file names and the text you wrote in a document.
+"""
+
+
+class HelpScreen(ModalScreen[None]):
+    BINDINGS = [Binding("escape,q,f1,question_mark", "close", "Close")]
+    DEFAULT_CSS = """
+    HelpScreen { align: center middle; }
+    HelpScreen > Vertical { width: 112; max-width: 96%; height: 90%; border: thick $primary; background: $surface; padding: 1 2; }
+    HelpScreen VerticalScroll { height: 1fr; }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            with VerticalScroll():
+                yield Static(HELP)
+            yield Label("[dim]Esc / F1 / ? closes this help[/]")
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class TuiReport(cli.Report):
     """cli.Report that reports into the log widget instead of stderr."""
 
@@ -107,6 +157,7 @@ class MetawipeApp(App):
         Binding("c", "clear_marks", "Clear marks"),
         Binding("r", "run", "Run"),
         Binding("f", "toggle_full", "Full scrub"),
+        Binding("f1,question_mark", "help", "Help"),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -146,7 +197,7 @@ class MetawipeApp(App):
         self.query_one("#preview").border_title = "Metadata preview"
         self.query_one("#log").border_title = "Results"
         self.query_one("#tree").focus()
-        self.log_line("Mark files with [b]space[/] or [b]m[/], run with [b]r[/]. Marked folders are scanned recursively.")
+        self.log_line("Mark files with [b]space[/] or [b]m[/], run with [b]r[/]. Marked folders are scanned recursively. [b]F1[/] shows what everything here does.")
 
     # ------------------------------------------------------------------ helpers
     def log_line(self, text: str) -> None:
@@ -159,7 +210,11 @@ class MetawipeApp(App):
             return str(path)
 
     def _refresh_tree(self) -> None:
-        self.query_one("#tree", MarkTree).refresh()
+        tree = self.query_one("#tree", MarkTree)
+        invalidate = getattr(tree, "_invalidate", None)  # drop the cached lines so the check boxes repaint
+        if invalidate is not None:
+            invalidate()
+        tree.refresh()
 
     # ------------------------------------------------------------------ marking
     def _current_path(self) -> Path | None:
@@ -187,6 +242,9 @@ class MetawipeApp(App):
         self.marks.clear()
         self._refresh_tree()
         self.sub_title = "0 marked"
+
+    def action_help(self) -> None:
+        self.push_screen(HelpScreen())
 
     def action_toggle_full(self) -> None:
         sw = self.query_one("#full", Switch)
