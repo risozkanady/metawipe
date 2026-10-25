@@ -55,15 +55,19 @@ On top of the normal cleaning, `--full`:
 - cleans pictures embedded in Office/ODF files (EXIF/GPS) and embedded JPEGs in PDFs;
 - drops `customXml` stores, printer settings (printer/user names), ODF `Configurations2/`,
   PDF page thumbnails and Word `docVars`;
-- removes H.264 encoder SEI messages (x264 version and settings) from videos;
+- removes encoder strings from inside the video bitstream: H.264 SEI (x264 version and settings) and
+  HEVC SEI plus the SEI arrays in the `hvcC` box (x265); HDR10 videos keep theirs because the HDR
+  metadata lives in the same messages (reported as incomplete);
 - sets the file modification time to 1980-01-01.
 
 If something identifying had to be left in a file (PDF attachments, XFA forms, JPEG 2000 images, OLE
-embeddings, HEVC encoder SEI), the file is reported `INCOMPLETE`, warnings say what, and the exit
+embeddings, HDR10/other-codec video bitstreams), the file is reported `INCOMPLETE`, warnings say what, and the exit
 status is 2.
 
-New files are created from scratch, so file system extras of the original (macOS extended attributes
-such as "where from", NTFS streams, birth time) are not carried over.
+Outputs are always new files, so file system extras of the original (extended attributes such as
+macOS "where from"/quarantine, NTFS streams, birth time) are not carried over - checked with
+Linux xattrs; the macOS and NTFS cases follow from the same mechanism but are untested. The
+change time (ctime) is set by the OS and cannot be altered.
 
 ## What is never touched
 

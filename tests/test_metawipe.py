@@ -27,6 +27,7 @@ except ImportError:  # pragma: no cover
 
 SECRET = b"SECRET-NAME"
 HAVE = {t: shutil.which(t) is not None for t in ("ffmpeg", "ffprobe", "heif-enc", "heif-info", "exiv2")}
+HAVE["x265"] = HAVE["ffmpeg"] and b"libx265" in subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True).stdout
 
 
 def run(*args):
@@ -513,6 +514,40 @@ class FullScrubTests(Base):
         n = subprocess.run(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v", "-show_entries", "stream=nb_read_frames",
                             "-of", "csv=p=0", str(p)], capture_output=True, text=True).stdout.strip()
         self.assertEqual(n, "10")
+
+    @unittest.skipUnless(HAVE["x265"] and HAVE["ffprobe"], "libx265 missing")
+    def test_hevc_encoder_string_removed_from_hvcc_and_stream(self):
+        p = self.dir / "h.mp4"
+        subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=d=1:s=64x64:r=10", "-c:v", "libx265",
+                        "-tag:v", "hvc1", str(p)], check=True)
+        self.assertIn(b"x265 (build", p.read_bytes())
+        size = p.stat().st_size
+        rc, out = self.run_full(p)
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn(b"x265 (build", p.read_bytes())
+        res = subprocess.run(["ffmpeg", "-v", "error", "-i", str(p), "-f", "null", "-"], capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stderr, "")
+        self.assertLess(abs(p.stat().st_size - size), 200)
+
+    @unittest.skipUnless(hasattr(os, "setxattr"), "no xattr support on this platform")
+    def test_extended_attributes_and_birth_not_carried_over(self):
+        p = self.dir / "a.png"
+        CliTests.png(self, p)
+        try:
+            os.setxattr(p, "user.xdg.origin.url", b"https://secret.example/x")
+        except OSError:
+            self.skipTest("file system without user xattrs")
+        os.utime(p, (1_700_000_000, 1_700_000_000))
+        rc, out = self.run_full(p)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(os.listxattr(p), [])
+        self.assertEqual((int(p.stat().st_mtime), int(p.stat().st_atime)), (315532800, 315532800))
+        q = self.dir / "b.png"
+        CliTests.png(self, q)
+        os.setxattr(q, "user.xdg.origin.url", b"https://secret.example/x")
+        self.assertEqual(run(q)[0], 0)  # default mode writes a fresh file too
+        self.assertEqual(os.listxattr(self.dir / "b.clean.png"), [])
 
 
 class CliTests(Base):
