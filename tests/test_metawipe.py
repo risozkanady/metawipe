@@ -382,12 +382,137 @@ class VideoTests(Base):
         self.assertIn(b"iPhone", raw)
         self.clean(p)
         data = p.read_bytes()
-        # (an encoder string inside the H.264 bitstream itself, e.g. x264's SEI, is not container metadata)
+        # (ffmpeg's native AAC encoder writes 'Lavc' into the audio stream itself - a fixture artifact; x264's SEI is covered by --full)
         for needle in (b"iPhone", SECRET, b"+48.1486", b"2026-01-02", b"Lavf"):
             self.assertNotIn(needle, data)
         streams = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(p)],
                                  capture_output=True, text=True).stdout.split()
         self.assertEqual(sorted(streams), ["aac", "h264"])
+
+
+@unittest.skipIf(Image is None, "Pillow missing")
+class FullScrubTests(Base):
+    def run_full(self, path):
+        rc, out, err = run("--full", "-i", path)
+        return rc, out + err
+
+    def test_docx_comment_authors_embedded_picture_customxml_printer(self):
+        gps = self.dir / "photo.jpg"
+        Image.new("RGB", (16, 16), "red").save(gps, exif=exif_image())
+        w = b'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+        comments = b"<w:comments " + w + b'><w:comment w:id="0" w:author="Jozko Mrkvicka" w:date="2024-01-01T10:00:00Z" w:initials="JM"/></w:comments>'
+        doc = b"<w:document " + w + b'><w:ins w:id="1" w:author="Jozko Mrkvicka" w:date="2024-02-02T10:00:00Z"/></w:document>'
+        settings = b"<w:settings " + w + b'><w:docVars><w:docVar w:name="who" w:val="Jozko"/></w:docVars></w:settings>'
+        ct = (b'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="x"/></Types>')
+        rels = (b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                b'<Relationship Id="r1" Type="t/doc" Target="word/document.xml"/>'
+                b'<Relationship Id="r2" Type="t/cx" Target="customXml/item1.xml"/></Relationships>')
+        p = self.dir / "a.docx"
+        PackageTests.zip(self, p, [("[Content_Types].xml", ct), ("_rels/.rels", rels), ("word/document.xml", doc),
+                                   ("word/comments.xml", comments), ("word/settings.xml", settings),
+                                   ("word/media/image1.jpeg", gps.read_bytes()),
+                                   ("customXml/item1.xml", b"<x>" + SECRET + b"</x>"),
+                                   ("xl/printerSettings/printerSettings1.bin", SECRET)])
+        rc, out = self.run_full(p)
+        self.assertEqual(rc, 0, out)
+        with zipfile.ZipFile(p) as z:
+            names = z.namelist()
+            self.assertFalse([n for n in names if n.startswith("customXml") or "printerSettings" in n], names)
+            blob = b"".join(z.read(n) for n in names)
+            self.assertNotIn(b"Mrkvicka", blob)
+            self.assertNotIn(SECRET, blob)
+            self.assertNotIn(b"iPhone", z.read("word/media/image1.jpeg"))
+            self.assertNotIn(b"w:date=", blob)
+            self.assertNotIn(b"docVar", blob)
+            self.assertNotIn(b"customXml", z.read("_rels/.rels"))
+            self.assertIn(b'w:author="Author"', z.read("word/comments.xml"))
+        self.assertEqual(Image.open(io.BytesIO(zipfile.ZipFile(p).read("word/media/image1.jpeg"))).size, (16, 16))
+        self.assertEqual(p.stat().st_mtime, 315532800)
+
+    def test_xlsx_pptx_odf_authors(self):
+        ct = b'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="x"/></Types>'
+        p = self.dir / "a.pptx"
+        PackageTests.zip(self, p, [("[Content_Types].xml", ct),
+                                   ("ppt/commentAuthors.xml", b'<p:cmAuthorLst><p:cmAuthor id="0" name="Jozko Mrkvicka" initials="JM"/></p:cmAuthorLst>'),
+                                   ("ppt/comments/comment1.xml", b'<p:cm authorId="0" dt="2024-03-03T10:00:00.000"/>')])
+        self.assertEqual(self.run_full(p)[0], 0)
+        with zipfile.ZipFile(p) as z:
+            self.assertNotIn(b"Mrkvicka", z.read("ppt/commentAuthors.xml"))
+            self.assertNotIn(b"2024", z.read("ppt/comments/comment1.xml"))
+        x = self.dir / "a.xlsx"
+        PackageTests.zip(self, x, [("[Content_Types].xml", ct),
+                                   ("xl/comments1.xml", b"<comments><authors><author>Jozko Mrkvicka</author></authors></comments>"),
+                                   ("xl/persons/person.xml", b'<personList><person displayName="Jozko Mrkvicka" userId="j@x.sk" providerId="AD"/></personList>')])
+        self.assertEqual(self.run_full(x)[0], 0)
+        with zipfile.ZipFile(x) as z:
+            self.assertNotIn(b"Mrkvicka", z.read("xl/comments1.xml") + z.read("xl/persons/person.xml"))
+            self.assertNotIn(b"j@x.sk", z.read("xl/persons/person.xml"))
+        mime = b"application/vnd.oasis.opendocument.text"
+        manifest = b'<manifest:manifest xmlns:manifest="m"><manifest:file-entry manifest:full-path="/" manifest:media-type="x"/></manifest:manifest>'
+        content = (b'<office:document-content><office:annotation><dc:creator>Jozko Mrkvicka</dc:creator>'
+                   b'<dc:date>2024-04-04T10:00:00</dc:date></office:annotation><text:author-name>Jozko Mrkvicka</text:author-name>'
+                   b'</office:document-content>')
+        o = self.dir / "a.odt"
+        PackageTests.zip(self, o, [("mimetype", mime), ("content.xml", content), ("META-INF/manifest.xml", manifest),
+                                   ("Configurations2/accelerator/current.xml", SECRET)], first_stored="mimetype")
+        self.assertEqual(self.run_full(o)[0], 0)
+        with zipfile.ZipFile(o) as z:
+            self.assertNotIn(b"Mrkvicka", z.read("content.xml"))
+            self.assertNotIn(b"2024", z.read("content.xml"))
+            self.assertFalse([n for n in z.namelist() if n.startswith("Configurations2")])
+
+    @unittest.skipIf(pypdf is None, "pypdf missing")
+    def test_pdf_annotation_author_embedded_jpeg_attachment_flag(self):
+        from pypdf.generic import ArrayObject, DictionaryObject, FloatObject, NameObject, NumberObject, TextStringObject, StreamObject
+
+        jpg = self.dir / "e.jpg"
+        Image.new("RGB", (8, 8), "blue").save(jpg, exif=exif_image())
+        w = pypdf.PdfWriter()
+        page = w.add_blank_page(100, 100)
+        img = StreamObject()
+        img._data = jpg.read_bytes()
+        img.update({NameObject("/Type"): NameObject("/XObject"), NameObject("/Subtype"): NameObject("/Image"),
+                    NameObject("/Width"): NumberObject(8), NameObject("/Height"): NumberObject(8),
+                    NameObject("/ColorSpace"): NameObject("/DeviceRGB"), NameObject("/BitsPerComponent"): NumberObject(8),
+                    NameObject("/Filter"): NameObject("/DCTDecode")})
+        ref = w._add_object(img)
+        page[NameObject("/Resources")] = DictionaryObject({NameObject("/XObject"): DictionaryObject({NameObject("/Im0"): ref})})
+        annot = DictionaryObject({
+            NameObject("/Type"): NameObject("/Annot"), NameObject("/Subtype"): NameObject("/Text"),
+            NameObject("/Rect"): ArrayObject([FloatObject(0), FloatObject(0), FloatObject(10), FloatObject(10)]),
+            NameObject("/T"): TextStringObject("Jozko Mrkvicka"), NameObject("/M"): TextStringObject("D:20240101000000"),
+            NameObject("/Contents"): TextStringObject("note"), NameObject("/Subj"): TextStringObject("Jozko")})
+        page[NameObject("/Annots")] = ArrayObject([w._add_object(annot)])
+        w.add_attachment("secret.txt", SECRET)
+        p = self.dir / "a.pdf"
+        with open(p, "wb") as fh:
+            w.write(fh)
+        rc, out = self.run_full(p)
+        self.assertEqual(rc, 2, out)  # attachment cannot be cleaned -> incomplete
+        self.assertIn("embedded file attachments", out)
+        r = pypdf.PdfReader(p)
+        annot_out = r.pages[0]["/Annots"][0].get_object()
+        self.assertNotIn("/T", annot_out)
+        self.assertNotIn("/M", annot_out)
+        self.assertEqual(annot_out["/Contents"], "note")
+        embedded = r.pages[0]["/Resources"]["/XObject"]["/Im0"].get_object()
+        self.assertNotIn(b"iPhone", embedded._data)
+        self.assertEqual(Image.open(io.BytesIO(embedded._data)).size, (8, 8))
+
+    @unittest.skipUnless(HAVE["ffmpeg"] and HAVE["ffprobe"], "ffmpeg missing")
+    def test_h264_encoder_sei_removed_only_in_full_mode(self):
+        p = self.dir / "a.mp4"
+        subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=d=1:s=64x64:r=10", "-c:v", "libx264", str(p)], check=True)
+        plain = self.dir / "plain.mp4"
+        shutil.copy(p, plain)
+        self.assertEqual(run("-i", plain)[0], 0)
+        self.assertIn(b"x264 - core", plain.read_bytes(), "default mode leaves the bitstream alone")
+        rc, out = self.run_full(p)
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn(b"x264 - core", p.read_bytes())
+        n = subprocess.run(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v", "-show_entries", "stream=nb_read_frames",
+                            "-of", "csv=p=0", str(p)], capture_output=True, text=True).stdout.strip()
+        self.assertEqual(n, "10")
 
 
 class CliTests(Base):
@@ -405,6 +530,7 @@ class CliTests(Base):
         Path(path).write_bytes(sig + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)) + chunk(b"tEXt", b"k\x00" + SECRET)
                                + chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00")) + chunk(b"IEND", b""))
 
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
     def test_default_copy_preserves_original_and_mode(self):
         p = self.dir / "a.png"
         self.png(p)
@@ -417,6 +543,7 @@ class CliTests(Base):
         self.assertNotIn(SECRET, out_path.read_bytes())
         self.assertEqual(stat.S_IMODE(out_path.stat().st_mode), 0o600)
 
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
     def test_in_place_keeps_permissions(self):
         p = self.dir / "a.png"
         self.png(p)
@@ -496,6 +623,7 @@ class CliTests(Base):
         self.assertIn("not found", err)
         self.assertIn("done:", out)
 
+    @unittest.skipIf(os.name == "nt", "Windows names are UTF-16")
     def test_non_utf8_filename(self):
         name = os.fsdecode(b"caf\xe9.png")
         p = self.dir / name

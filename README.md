@@ -16,7 +16,7 @@ Command-line tool that strips identifying metadata from files before you share t
 ```
 git clone https://github.com/wspnowpartnerGAUC/metawipe && cd metawipe
 python3 -m venv .venv && source .venv/bin/activate
-pip install .            # or: pip install -r requirements.txt  and use  python -m metawipe
+pip install .            # puts a `metawipe` command in the venv; or use  python -m metawipe
 ```
 
 Videos need `ffmpeg` on the PATH (`brew install ffmpeg`, `pacman -S ffmpeg`, ...). Everything else is pure Python.
@@ -42,12 +42,33 @@ metawipe -p secret locked.pdf          # password for encrypted PDFs
 - **ICC colour profiles**, PNG gamma/sRGB, DPI and PDF/Office content itself.
 - Extra images of a JPEG (MPO/Ultra HDR gain maps) and data after the end of a file are **dropped**.
 
-## What it does not touch
+## Full scrub (`--full`)
 
-- Text, comments, tracked changes and their author names inside documents; embedded images inside
-  PDFs/Office files; `customXml` parts and binary OLE embeddings (a warning is printed).
-- Encoder strings inside the video bitstream (e.g. x264 SEI), file system data (timestamps,
-  macOS extended attributes such as "where from", NTFS streams).
+```
+metawipe --full -i report.docx video.mp4
+```
+
+On top of the normal cleaning, `--full`:
+
+- anonymises author names, initials and dates on comments, tracked changes and people lists
+  (docx, xlsx, pptx, OpenDocument) and on PDF annotations (comment *text* is kept);
+- cleans pictures embedded in Office/ODF files (EXIF/GPS) and embedded JPEGs in PDFs;
+- drops `customXml` stores, printer settings (printer/user names), ODF `Configurations2/`,
+  PDF page thumbnails and Word `docVars`;
+- removes H.264 encoder SEI messages (x264 version and settings) from videos;
+- sets the file modification time to 1980-01-01.
+
+If something identifying had to be left in a file (PDF attachments, XFA forms, JPEG 2000 images, OLE
+embeddings, HEVC encoder SEI), the file is reported `INCOMPLETE`, warnings say what, and the exit
+status is 2.
+
+New files are created from scratch, so file system extras of the original (macOS extended attributes
+such as "where from", NTFS streams, birth time) are not carried over.
+
+## What is never touched
+
+- Document text itself, comment text, and anything identifying that you typed into a document.
+- File names (they are often the leak: `IMG_1234 - Jozko.jpg`).
 - BigTIFF, GIF, RAW/DNG, MKV/WebM.
 
 ## Tests

@@ -33,10 +33,13 @@ class Job:
     inplace: bool
 
 
+_FULL_MTIME = 315532800  # 1980-01-01T00:00:00Z
+
+
 class Report:
     def __init__(self, verbose: bool):
         self.verbose = verbose
-        self.cleaned = self.failed = self.skipped = 0
+        self.cleaned = self.failed = self.skipped = self.incomplete = 0
 
     def fail(self, path, msg: str) -> None:
         self.failed += 1
@@ -152,8 +155,9 @@ def _validate(jobs: list[Job], args, report: Report) -> list[Job]:
     return final
 
 
-def _run(job: Job, args) -> None:
-    ctx = Context(password=args.password, warn=lambda msg: print(f"warn   {job.src}: {msg}", file=sys.stderr))
+def _run(job: Job, args) -> Context:
+    ctx = Context(password=args.password, full=args.full,
+                  warn=lambda msg: print(f"warn   {job.src}: {msg}", file=sys.stderr))
     job.dst.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=job.dst.parent, prefix=".metawipe-", suffix=job.src.suffix)
     os.close(fd)
@@ -161,6 +165,8 @@ def _run(job: Job, args) -> None:
     try:
         _handler(job.src)(job.src, tmp, ctx)
         shutil.copymode(job.src, tmp)
+        if args.full:
+            os.utime(tmp, (_FULL_MTIME, _FULL_MTIME))
         os.replace(tmp, job.dst)
     finally:
         try:
@@ -169,6 +175,7 @@ def _run(job: Job, args) -> None:
             pass
         except OSError:
             pass
+    return ctx
 
 
 def main(argv=None) -> int:
@@ -187,6 +194,10 @@ def main(argv=None) -> int:
     ap.add_argument("-o", "--output-dir", type=Path, help="write cleaned copies here, keeping the folder structure")
     ap.add_argument("-f", "--force", action="store_true", help="overwrite existing output files")
     ap.add_argument("-p", "--password", help="password for encrypted PDFs")
+    ap.add_argument("--full", action="store_true", help=(
+        "full scrub: also anonymise comment/revision authors and dates, clean pictures embedded in "
+        "documents, drop customXml/printer settings, strip encoder SEI from H.264, set mtime to 1980; "
+        "exit status 2 if something identifying had to be left"))
     ap.add_argument("-v", "--verbose", action="store_true", help="also list skipped files")
     ap.add_argument("--version", action="version", version=f"metawipe {__version__}")
     args = ap.parse_args(argv)
@@ -197,7 +208,7 @@ def main(argv=None) -> int:
     jobs = _validate(_collect(args, report), args, report)
     for job in jobs:
         try:
-            _run(job, args)
+            ctx = _run(job, args)
         except WipeError as e:
             report.fail(job.src, str(e))
         except Exception as e:  # noqa: BLE001 - one bad file must not stop the batch
@@ -205,6 +216,13 @@ def main(argv=None) -> int:
         else:
             report.cleaned += 1
             target = "in place" if job.inplace else f"-> {job.dst}"
-            print(f"clean  {job.src} {target}")
-    print(f"done: {report.cleaned} cleaned, {report.failed} failed, {report.skipped} skipped")
-    return 1 if report.failed else 0
+            partial = ""
+            if args.full and ctx.residue:
+                report.incomplete += 1
+                partial = f" (INCOMPLETE: {len(ctx.residue)} item(s) left, see warnings)"
+            print(f"clean  {job.src} {target}{partial}")
+    summary = f"done: {report.cleaned} cleaned, {report.failed} failed, {report.skipped} skipped"
+    if args.full:
+        summary += f", {report.incomplete} incomplete"
+    print(summary)
+    return 1 if report.failed else (2 if report.incomplete else 0)
