@@ -114,12 +114,32 @@ def _iloc_extents(buf: bytearray, payload: int, end: int, wanted: set[int]) -> d
     return result
 
 
+def _clean_moov(buf: bytearray, start: int, end: int) -> None:
+    """Image sequences keep movie-style boxes: zero creation/modification times, blank udta/meta."""
+    for btype, box_start, payload, box_end in _boxes(buf, start, end):
+        if btype in (b"mvhd", b"tkhd", b"mdhd"):
+            _blank(buf, payload + 4, payload + (20 if buf[payload] == 1 else 12))
+        elif btype in (b"udta", b"meta"):
+            _blank(buf, payload, box_end)
+            buf[box_start + 4:box_start + 8] = b"free"
+        elif btype in (b"trak", b"mdia"):
+            _clean_moov(buf, payload, box_end)
+
+
 def clean_heif(data: bytes) -> bytes:
     buf = bytearray(data)
     end = len(buf)
     top = list(_boxes(buf, 0, end))
     if not top or top[0][0] != b"ftyp":
         raise WipeError("not a HEIF/AVIF file (no ftyp box)")
+    kinds = {b[0] for b in top}
+    if b"mini" in kinds:
+        raise WipeError("HEIF 'mini' layout (brand mif3) is not supported")
+    if b"meta" not in kinds and b"moov" not in kinds:
+        raise WipeError("no meta or moov box found; cannot tell where the metadata is")
+    for btype, _, payload, box_end in top:
+        if btype == b"moov":
+            _clean_moov(buf, payload, box_end)
     metas = [b for b in top if b[0] == b"meta"]
     for btype, box_start, payload, box_end in top:
         if btype in _BLANK_BOXES:
@@ -165,6 +185,14 @@ def clean_heif(data: bytes) -> bytes:
             if btype in _BLANK_BOXES:
                 _blank(buf, pp, be)
                 buf[bs + 4:bs + 8] = b"free"
+            elif btype == b"iprp":
+                for ptype, ps, pp2, pe in _boxes(buf, pp, be):
+                    if ptype != b"ipco":
+                        continue
+                    for prop, prs, prp, pre in _boxes(buf, pp2, pe):
+                        if prop == b"udes":  # user description: name/description/tags
+                            _blank(buf, prp, pre)
+                            buf[prs + 4:prs + 8] = b"free"  # keeps ipma property indices valid
     return bytes(buf)
 
 

@@ -348,13 +348,13 @@ class PackageTests(Base):
 
     def test_odf(self):
         mime = b"application/vnd.oasis.opendocument.text"
-        manifest = (b'<manifest:manifest xmlns:manifest="m">'
+        manifest = (b'<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0">'
                     b'<manifest:file-entry manifest:full-path="/" manifest:media-type="' + mime + b'"/>'
                     b'<manifest:file-entry manifest:full-path="Thumbnails/thumbnail.png" manifest:media-type="image/png"/>'
                     b'<manifest:file-entry manifest:full-path="content.xml" manifest:media-type="text/xml"/></manifest:manifest>')
         p = self.dir / "a.odt"
         self.zip(p, [("content.xml", b"<c>body</c>"), ("mimetype", mime), ("meta.xml", b"<m>" + SECRET + b"</m>"),
-                     ("settings.xml", b"<s>PrinterName " + SECRET + b"</s>"),
+                     ("settings.xml", b'<office:document-settings xmlns:config="c"><config:config-item config:name="PrinterName" config:type="string">' + SECRET + b'</config:config-item><config:config-item config:name="ZoomValue" config:type="int">100</config:config-item></office:document-settings>'),
                      ("Thumbnails/thumbnail.png", SECRET), ("META-INF/manifest.xml", manifest)], first_stored="mimetype")
         self.clean(p)
         with zipfile.ZipFile(p) as z:
@@ -365,6 +365,7 @@ class PackageTests(Base):
             self.assertNotIn(b"Thumbnails", z.read("META-INF/manifest.xml"))
             self.assertIn(b"content.xml", z.read("META-INF/manifest.xml"))
             self.assertEqual(z.read("content.xml"), b"<c>body</c>")
+            self.assertIn(b"ZoomValue", z.read("settings.xml"))
             for n in z.namelist():
                 self.assertNotIn(SECRET, z.read(n))
         self.assertNormalised(p)
@@ -449,7 +450,7 @@ class FullScrubTests(Base):
             self.assertNotIn(b"Mrkvicka", z.read("xl/comments1.xml") + z.read("xl/persons/person.xml"))
             self.assertNotIn(b"j@x.sk", z.read("xl/persons/person.xml"))
         mime = b"application/vnd.oasis.opendocument.text"
-        manifest = b'<manifest:manifest xmlns:manifest="m"><manifest:file-entry manifest:full-path="/" manifest:media-type="x"/></manifest:manifest>'
+        manifest = b'<manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0"><manifest:file-entry manifest:full-path="/" manifest:media-type="x"/></manifest:manifest>'
         content = (b'<office:document-content><office:annotation><dc:creator>Jozko Mrkvicka</dc:creator>'
                    b'<dc:date>2024-04-04T10:00:00</dc:date></office:annotation><text:author-name>Jozko Mrkvicka</text:author-name>'
                    b'</office:document-content>')

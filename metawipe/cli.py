@@ -5,6 +5,8 @@ import argparse
 import os
 import re
 import shutil
+import signal
+import stat
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -56,7 +58,8 @@ def _handler(path: Path):
 
 
 def _is_transient(name: str) -> bool:
-    return name.startswith("~$") or name.startswith(".metawipe-")
+    """Lock files, our own temp files and macOS AppleDouble sidecars; only skipped while scanning."""
+    return name.startswith(("~$", ".metawipe-", "._"))
 
 
 def _dst_for(src: Path, root: Path | None, args) -> Path:
@@ -72,7 +75,19 @@ def _collect(args, report: Report) -> list[Job]:
     out_real = os.path.realpath(args.output_dir) if args.output_dir else None
 
     def add(src: Path, root: Path | None, explicit: bool) -> None:
-        if _is_transient(src.name):
+        if not explicit and _is_transient(src.name):
+            report.skip(src, "lock/temp/sidecar file")
+            return
+        try:
+            regular = stat.S_ISREG(os.stat(src).st_mode)
+        except OSError as e:
+            report.fail(src, e.strerror or str(e))
+            return
+        if not regular:
+            if explicit:
+                report.fail(src, "not a regular file")
+            else:
+                report.skip(src, "not a regular file")
             return
         if _handler(src) is None:
             if explicit:
@@ -80,7 +95,7 @@ def _collect(args, report: Report) -> list[Job]:
             else:
                 report.skip(src, "unsupported type")
             return
-        if not (args.in_place or args.output_dir):
+        if not explicit and not (args.in_place or args.output_dir):
             m = _OUTPUT_NAME.match(src.name)
             if m and (src.parent / (m["stem"] + m["ext"])).exists():
                 report.skip(src, "looks like the output of an earlier run")
@@ -91,6 +106,9 @@ def _collect(args, report: Report) -> list[Job]:
         report.fail(err.filename, f"cannot read directory: {err.strerror}")
 
     for raw in args.paths:
+        if not raw:
+            report.fail("''", "empty path argument")
+            continue
         p = Path(raw)
         if not os.path.lexists(p):
             report.fail(p, "not found")
@@ -108,12 +126,15 @@ def _collect(args, report: Report) -> list[Job]:
                         add(Path(dirpath, f), p, False)
             else:
                 try:
-                    names = sorted(e.name for e in os.scandir(p) if e.is_file())
+                    entries = sorted(os.scandir(p), key=lambda e: e.name)
                 except OSError as e:
                     report.fail(p, f"cannot read directory: {e.strerror}")
                     continue
-                for f in names:
-                    add(p / f, p, False)
+                for e in entries:
+                    if e.is_dir(follow_symlinks=False):
+                        report.skip(e.path, "directory; use -r to descend")
+                    else:
+                        add(Path(e.path), p, False)
         else:
             add(p, None, True)
     return jobs
@@ -121,13 +142,14 @@ def _collect(args, report: Report) -> list[Job]:
 
 def _validate(jobs: list[Job], args, report: Report) -> list[Job]:
     ok: list[Job] = []
-    seen_src: set[str] = set()
+    index: dict[str, int] = {}
     for job in jobs:
         key = os.path.realpath(job.src)
-        if key in seen_src:
-            continue
-        seen_src.add(key)
-        ok.append(job)
+        if key not in index:
+            index[key] = len(ok)
+            ok.append(job)
+        elif ok[index[key]].src.is_symlink() and not job.src.is_symlink():
+            ok[index[key]] = job  # the real file wins over a symlink to it
     srcs = {os.path.realpath(j.src) for j in ok}
     claimed: dict[str, Path] = {}
     final: list[Job] = []
@@ -138,6 +160,9 @@ def _validate(jobs: list[Job], args, report: Report) -> list[Job]:
                 continue
             if job.src.stat().st_nlink > 1:
                 report.fail(job.src, "has other hard links; in-place cleaning would leave them uncleaned")
+                continue
+            if not os.access(job.src, os.W_OK):
+                report.fail(job.src, "is read-only; make it writable or use -o")
                 continue
         else:
             dst_key = os.path.abspath(job.dst)
@@ -155,26 +180,50 @@ def _validate(jobs: list[Job], args, report: Report) -> list[Job]:
     return final
 
 
+def _missing_dirs(path: Path) -> list[Path]:
+    missing = []
+    while not path.exists():
+        missing.append(path)
+        path = path.parent
+    return missing
+
+
 def _run(job: Job, args) -> Context:
     ctx = Context(password=args.password, full=args.full,
                   warn=lambda msg: print(f"warn   {job.src}: {msg}", file=sys.stderr))
+    created = _missing_dirs(job.dst.parent)
     job.dst.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=job.dst.parent, prefix=".metawipe-", suffix=job.src.suffix)
     os.close(fd)
     tmp = Path(tmp_name)
+    ok = False
     try:
-        _handler(job.src)(job.src, tmp, ctx)
-        shutil.copymode(job.src, tmp)
+        try:
+            _handler(job.src)(job.src, tmp, ctx)
+        except WipeError as e:
+            raise WipeError(str(e).replace(tmp_name, str(job.dst))) from e
+        st = job.src.stat()
+        os.chmod(tmp, stat.S_IMODE(st.st_mode) & 0o777)  # no setuid/setgid/sticky on outputs
+        if job.inplace:
+            try:
+                os.chown(tmp, -1, st.st_gid)  # keep the group where we are allowed to
+            except (OSError, AttributeError):
+                pass
         if args.full:
             os.utime(tmp, (_FULL_MTIME, _FULL_MTIME))
         os.replace(tmp, job.dst)
+        ok = True
     finally:
         try:
             tmp.unlink()
-        except FileNotFoundError:
-            pass
         except OSError:
             pass
+        if not ok:
+            for d in created:  # directories this job created and left empty
+                try:
+                    d.rmdir()
+                except OSError:
+                    break
     return ctx
 
 
@@ -204,7 +253,22 @@ def main(argv=None) -> int:
     if args.in_place and args.output_dir:
         ap.error("--in-place and --output-dir are mutually exclusive")
 
+    def _terminate(signum, frame):
+        raise KeyboardInterrupt
+
+    for sig in ("SIGTERM", "SIGHUP"):  # run the cleanup in `finally` blocks instead of leaving temp files
+        if hasattr(signal, sig):
+            signal.signal(getattr(signal, sig), _terminate)
+
     report = Report(args.verbose)
+    try:
+        return _main(args, report)
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+
+
+def _main(args, report: Report) -> int:
     jobs = _validate(_collect(args, report), args, report)
     for job in jobs:
         try:

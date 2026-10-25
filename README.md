@@ -6,8 +6,8 @@ Command-line tool that strips identifying metadata from files before you share t
 |------|-----------|-----|
 | Photos | `jpg jpeg png apng webp tif tiff` | Container-level: pixels are copied byte for byte (no re-encoding), only structural parts are kept |
 | iPhone/HEIF | `heic heif avif` | Exif/XMP payloads zeroed in place, file size and image data unchanged |
-| Video | `mov mp4 m4v 3gp` | `ffmpeg -c copy`: no re-encode; location, device, creation time and metadata tracks dropped |
-| PDF | `pdf` | pypdf: Info dictionary, XMP, page/object `/Metadata`, `/PieceInfo`; outlines, forms, layers survive |
+| Video | `mov mp4 m4v 3gp` | `ffmpeg -c copy`: no re-encode; location, device, creation time, metadata tracks and cover art dropped; track languages kept |
+| PDF | `pdf` | pypdf: Info dictionary, XMP, `/PieceInfo`, thumbnails, file `/ID`, pdfTeX paths, signature identities; outlines, forms, layers survive |
 | Office | `docx xlsx pptx` (+ macro/template variants) | properties, thumbnail, people list, template path, absolute path; nested packages cleaned too |
 | OpenDocument | `odt ods odp odg` (+ templates) | `meta.xml` emptied, thumbnail and printer settings removed |
 
@@ -32,7 +32,7 @@ metawipe -p secret locked.pdf          # password for encrypted PDFs
 
 - Existing output files are never overwritten unless you pass `-f`.
 - `-i` refuses symlinks and hard-linked files (the other names would keep the metadata).
-- File permissions are preserved; modification time is "now".
+- File permissions are preserved (setuid/setgid/sticky bits are not); modification time is "now".
 - Exit status is 1 if any file failed or was an explicit argument of an unsupported type.
   Unsupported files found while scanning a directory are only counted (`-v` lists them).
 
@@ -40,7 +40,8 @@ metawipe -p secret locked.pdf          # password for encrypted PDFs
 
 - **Orientation** of photos (a one-tag Exif block): dropping it would turn portrait photos sideways.
 - **ICC colour profiles**, PNG gamma/sRGB, DPI and PDF/Office content itself.
-- Extra images of a JPEG (MPO/Ultra HDR gain maps) and data after the end of a file are **dropped**.
+- Extra images of a JPEG (MPO/Ultra HDR gain maps), Exif-style TIFF thumbnails and data after the end of a file are **dropped**.
+- Digital signatures (PDF, Office, ODF) are removed, because cleaning invalidates them anyway.
 
 ## Full scrub (`--full`)
 
@@ -68,6 +69,14 @@ Outputs are always new files, so file system extras of the original (extended at
 macOS "where from"/quarantine, NTFS streams, birth time) are not carried over - checked with
 Linux xattrs; the macOS and NTFS cases follow from the same mechanism but are untested. The
 change time (ctime) is set by the OS and cannot be altered.
+
+## Refused or reported instead of cleaned
+
+- Encrypted OpenDocument files and HEIF files in the compact `mini` layout (`mif3`) are refused.
+- Truncated or damaged videos fail instead of producing a partial copy.
+- Dolby Vision signalling cannot be written into `.mov` by ffmpeg (a warning says so); `.mp4`/`.m4v` keep it.
+- Warnings are printed for OLE embeddings, `customXml` (dropped by `--full`) and PDF pages that are no
+  longer in the page tree but still referenced by bookmarks or links.
 
 ## What is never touched
 
