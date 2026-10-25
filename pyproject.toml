@@ -11,6 +11,9 @@ license = { file = "LICENSE" }
 requires-python = ">=3.9"
 dependencies = ["pypdf[crypto]>=5.0"]
 
+[project.optional-dependencies]
+tui = ["textual>=0.80"]
+
 [project.scripts]
 metawipe = "metawipe.cli:main"
 

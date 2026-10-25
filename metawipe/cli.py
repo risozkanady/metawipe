@@ -188,9 +188,9 @@ def _missing_dirs(path: Path) -> list[Path]:
     return missing
 
 
-def _run(job: Job, args) -> Context:
+def _run(job: Job, args, warn=None) -> Context:
     ctx = Context(password=args.password, full=args.full,
-                  warn=lambda msg: print(f"warn   {job.src}: {msg}", file=sys.stderr))
+                  warn=warn or (lambda msg: print(f"warn   {job.src}: {msg}", file=sys.stderr)))
     created = _missing_dirs(job.dst.parent)
     job.dst.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=job.dst.parent, prefix=".metawipe-", suffix=job.src.suffix)
@@ -227,6 +227,16 @@ def _run(job: Job, args) -> Context:
     return ctx
 
 
+def plan(args, report: Report) -> list[Job]:
+    """Collect and validate the files to clean (also used by the TUI)."""
+    return _validate(_collect(args, report), args, report)
+
+
+def execute(job: Job, args, warn=None) -> Context:
+    """Clean one planned file; raises WipeError/OSError on failure (also used by the TUI)."""
+    return _run(job, args, warn)
+
+
 def main(argv=None) -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -237,7 +247,8 @@ def main(argv=None) -> int:
         prog="metawipe",
         description="Strip metadata from images, HEIC, videos, PDFs and Office/OpenDocument files.",
     )
-    ap.add_argument("paths", nargs="+", help="files or directories")
+    ap.add_argument("paths", nargs="*", help="files or directories (none: open the interactive UI)")
+    ap.add_argument("--tui", action="store_true", help="open the interactive terminal UI")
     ap.add_argument("-r", "--recursive", action="store_true", help="recurse into directories")
     ap.add_argument("-i", "--in-place", action="store_true", help="overwrite originals (default: write NAME.clean.EXT)")
     ap.add_argument("-o", "--output-dir", type=Path, help="write cleaned copies here, keeping the folder structure")
@@ -252,6 +263,14 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     if args.in_place and args.output_dir:
         ap.error("--in-place and --output-dir are mutually exclusive")
+    if args.tui or (not args.paths and sys.stdin.isatty() and sys.stdout.isatty()):
+        try:
+            from . import tui
+        except ImportError:
+            ap.error("the interactive UI needs Textual: pip install 'metawipe[tui]'")
+        return tui.run(args.paths[0] if args.paths else None)
+    if not args.paths:
+        ap.error("no files given (run without arguments in a terminal for the interactive UI)")
 
     def _terminate(signum, frame):
         raise KeyboardInterrupt
@@ -269,7 +288,7 @@ def main(argv=None) -> int:
 
 
 def _main(args, report: Report) -> int:
-    jobs = _validate(_collect(args, report), args, report)
+    jobs = plan(args, report)
     for job in jobs:
         try:
             ctx = _run(job, args)
