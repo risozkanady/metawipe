@@ -8,6 +8,7 @@ result is re-read and scanned before it is accepted.
 """
 from __future__ import annotations
 
+import bisect
 import re
 from pathlib import Path
 
@@ -19,6 +20,7 @@ _INFO_IDENTITY = _INFO_KEYS - {"/Title", "/Subject", "/Keywords", "/Trapped"}
 _PTEX = ("/PTEX.FileName", "/PTEX.PageNumber", "/PTEX.InfoDict")
 _PRIVATE = ("/PieceInfo", "/LastModified")  # application data and edit dates on the catalog, pages, forms, images
 _ANNOT_IDENTITY = ("/T", "/M", "/CreationDate", "/Subj", "/NM")  # author, dates, subject, unique name
+_FIELD_IDENTITY = _ANNOT_IDENTITY[1:]  # on form fields and widgets /T is the field name (structure), the rest is still identity
 _SIG_TYPES = ("/Sig", "/DocTimeStamp")
 # Inline-image abbreviations, which readers also accept on image streams.
 _FILTER_NAMES = {"/AHx": "/ASCIIHexDecode", "/A85": "/ASCII85Decode", "/LZW": "/LZWDecode", "/Fl": "/FlateDecode",
@@ -27,8 +29,11 @@ _FILTER_NAMES = {"/AHx": "/ASCIIHexDecode", "/A85": "/ASCII85Decode", "/LZW": "/
 _WRAPPERS = {"/ASCIIHexDecode", "/ASCII85Decode", "/LZWDecode", "/FlateDecode", "/RunLengthDecode"}
 _ORPHAN_NOTE = "pages that are not in the page tree (deleted pages still referenced by bookmarks/links)"
 _ATTACH_NOTE = "embedded file attachments"
-# An inline image's dictionary in a content stream: BI <dictionary> ID <data> EI.
-_INLINE_IMAGE = re.compile(rb"(?<![^\s\]>)])BI\s(.{0,4096}?)\sID\s", re.S)
+# An inline image in a content stream: BI <dictionary> ID <data> EI. Both markers are found in one
+# pass each (a bounded dictionary per BI, matched to the nearest ID by bisection), so the scan stays linear.
+_INLINE_BI = re.compile(rb"(?<![^\s\]>)])BI\s")
+_INLINE_ID = re.compile(rb"(?=\sID\s)")  # zero-width, so overlapping ID tokens are all found
+_INLINE_DICT_MAX = 4096
 
 
 def _is_xmp(value) -> bool:
@@ -300,14 +305,30 @@ def _inline_jpeg(obj, page: bool) -> bool:
     else:
         return False
     data = _content(s for s in streams if hasattr(s, "_data"))
-    return any(b"/DCT" in m.group(1) for m in _INLINE_IMAGE.finditer(data))
+    if b"/DCT" not in data:
+        return False
+    ids = [m.start() for m in _INLINE_ID.finditer(data)]
+    pos = 0
+    for m in _INLINE_BI.finditer(data):
+        if m.start() < pos:  # inside the previous image's dictionary or data
+            continue
+        start = m.end()  # first byte of the image dictionary
+        i = bisect.bisect_left(ids, start)  # the whitespace before ID cannot be the one after BI
+        if i == len(ids) or ids[i] - start > _INLINE_DICT_MAX:
+            continue
+        if b"/DCT" in data[start:ids[i]]:
+            return True
+        pos = ids[i] + 4
+    return False
 
 
 def _full_checks(obj, ctx: Context, notes: set[str], page: bool) -> None:
     """--full: annotation authors/dates, EXIF inside embedded JPEGs; flag what cannot be cleaned."""
     # Form fields and their widgets keep /T: it is the field name, which forms are addressed by.
-    if (obj.get("/Type") == "/Annot" or ("/Subtype" in obj and "/Rect" in obj)) and not _is_field(obj):
-        _pop(obj, _ANNOT_IDENTITY)
+    if obj.get("/Type") == "/Annot" or ("/Subtype" in obj and "/Rect" in obj):
+        _pop(obj, _FIELD_IDENTITY if _is_field(obj) else _ANNOT_IDENTITY)
+    elif "/FT" in obj or ("/Kids" in obj and "/T" in obj):
+        _pop(obj, _FIELD_IDENTITY)  # a field (or an intermediate field node) that is not a widget itself
     if "/XFA" in obj:
         notes.add("XFA form data")
     if obj.get("/Subtype") == "/Image":
@@ -320,6 +341,7 @@ def clean_pdf(src: Path, dst: Path, ctx: Context) -> None:
     try:
         from pypdf import PdfReader, PdfWriter
         from pypdf.errors import DependencyError, PyPdfError
+        from pypdf.generic import DictionaryObject
     except ImportError as e:
         raise WipeError("pypdf is required for PDF files: pip install -r requirements.txt") from e
 
@@ -331,7 +353,10 @@ def clean_pdf(src: Path, dst: Path, ctx: Context) -> None:
             ctx.warn("encryption and permission restrictions are removed from the output")
         # Strip the in-memory copy *before* cloning: pypdf keeps every object it cloned, so
         # removing a key afterwards would leave the XMP stream behind as an unreferenced object.
-        warnings, notes = _strip(reader.trailer["/Root"], reader, ctx)
+        root = _resolve(reader.trailer.get("/Root"))
+        if not isinstance(root, DictionaryObject) or hasattr(root, "_data"):  # stripping the catalog is the point: do not write a file without it
+            raise WipeError("cannot process PDF: the document catalog (/Root) is missing or not a dictionary")
+        warnings, notes = _strip(root, reader, ctx)
         reader.trailer.pop("/ID", None)  # the permanent file identifier links the output to the original
         writer = PdfWriter(clone_from=reader)
         writer.metadata = None
@@ -351,6 +376,8 @@ def clean_pdf(src: Path, dst: Path, ctx: Context) -> None:
         raise WipeError("PDF structure is nested too deeply to process") from e
     except NotImplementedError as e:
         raise WipeError(f"unsupported PDF feature: {e}") from e
+    except (LookupError, AttributeError, TypeError, ValueError) as e:  # noqa: BLE001 - pypdf on damaged structures (missing /Size, bad references)
+        raise WipeError(f"cannot process PDF: damaged structure ({type(e).__name__}: {e})") from e
 
 
 def _verify(path: Path) -> None:

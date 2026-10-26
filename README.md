@@ -43,8 +43,8 @@ metawipe -p secret locked.pdf          # password for encrypted PDFs
 
 - **Orientation** of photos (a one-tag Exif block): dropping it would turn portrait photos sideways.
 - **ICC colour profiles**, PNG gamma/sRGB, DPI and PDF/Office content itself.
-- Extra images of a JPEG (MPO/Ultra HDR gain maps), Exif-style TIFF thumbnails (a later old-style JPEG IFD that
-  carries ImageWidth/ImageLength is kept as a page) and data after the end of a file are **dropped**.
+- Extra images of a JPEG (MPO/Ultra HDR gain maps), Exif-style TIFF thumbnails (the second IFD, old-style JPEG without strips,
+  even with ImageWidth/ImageLength, unless it is as large as the first page; later IFDs with dimensions are kept as pages) and data after the end of a file are **dropped**.
 - PNG orientation, also in ImageMagick's private `orNT` chunk.
 - HEIF/AVIF handler, compressor and item names are blanked in place (size and offsets unchanged).
 - Digital signatures (PDF, Office, ODF) are removed, because cleaning invalidates them anyway.
@@ -87,7 +87,7 @@ change time (ctime) is set by the OS and cannot be altered.
 ## Refused or reported instead of cleaned
 
 - Encrypted OpenDocument files and HEIF files in the compact `mini` layout (`mif3`) are refused.
-- Truncated or damaged videos fail instead of producing a partial copy; damaged TIFFs (strips past the end
+- Truncated or damaged videos (including truncated fragmented MP4) fail instead of producing a partial copy; damaged TIFFs (strips past the end
   of the file, overlapping structures) fail instead of being zero-padded.
 - Dolby Vision signalling cannot be written into `.mov` by ffmpeg (a warning says so); `.mp4`/`.m4v` keep it.
 - Warnings are printed for OLE embeddings, `customXml` (dropped by `--full`) and PDF pages that are no

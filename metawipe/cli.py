@@ -199,6 +199,20 @@ def _hide_temp(text: str, tmp: Path, dst: Path) -> str:
     return text.replace(tmp.name, dst.name)
 
 
+def _os_error_for(e: OSError, tmp: Path, dst: Path) -> OSError:
+    """The same error with our temp file replaced by the destination in its file names. The message is rebuilt
+    (OSError prints "-> None" when filename2 is merely set to None) and names the destination only once."""
+    names = [n for n in (e.filename, e.filename2) if n is not None]
+    if not names or e.errno is None or not any(_hide_temp(str(n), tmp, dst) != str(n) for n in names):
+        return e
+    first, second = (_hide_temp(str(n), tmp, dst) if n is not None else None for n in (e.filename, e.filename2))
+    if second == first:
+        second = None
+    new = type(e)(e.errno, e.strerror, first, None, second)
+    new.__cause__ = e
+    return new
+
+
 def _finish(tmp: Path, st: os.stat_result, inplace: bool, full: bool) -> None:
     """Permissions, owner and mtime of the finished temp file, applied through an open descriptor so a path swapped
     for a symlink or a hard link (the directory may belong to somebody else when running as root) cannot redirect them."""
@@ -247,14 +261,13 @@ def _run(job: Job, args, warn=None) -> Context:
         except WipeError as e:
             raise WipeError(_hide_temp(str(e), tmp, job.dst)) from e
         except Exception as e:
-            if isinstance(e, OSError):  # e.g. full disk, unwritable directory, destination is a directory
-                if e.filename is not None and _hide_temp(str(e.filename), tmp, job.dst) != str(e.filename):
-                    e.filename = str(job.dst)
-                    if e.filename2 is not None and str(e.filename2) == str(job.dst):
-                        e.filename2 = None
-            text = str(e)
+            # e.g. full disk, unwritable directory, destination is a directory
+            err = _os_error_for(e, tmp, job.dst) if isinstance(e, OSError) else e
+            text = str(err)
             if _hide_temp(text, tmp, job.dst) != text:
-                raise WipeError(f"{type(e).__name__}: {_hide_temp(text, tmp, job.dst)}") from e
+                raise WipeError(f"{type(err).__name__}: {_hide_temp(text, tmp, job.dst)}") from e
+            if err is not e:
+                raise err from e
             raise
         ok = True
     finally:

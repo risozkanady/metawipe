@@ -213,8 +213,8 @@ _TIFF_DATA_TAGS = ((273, 279), (324, 325), (513, 514))  # (offsets, byte counts)
 _TIFF_TABLE_TAGS = {519, 520, 521}  # offsets to JPEG tables of unknown length
 _TIFF_TYPE_SIZE = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8, 13: 4, 16: 8, 17: 8, 18: 8}
 _TIFF_VALUE_CODE = {1: "B", 3: "H", 4: "I", 13: "I"}
-_TIFF_MAX_WORK = 2_000_000  # entries + values parsed per file; crafted files could otherwise cost hours or GBs
-_TIFF_MAX_IFDS = 10000
+_TIFF_MAX_WORK = 3_000_000  # entries + values + ranges parsed per file; crafted files could otherwise cost hours or GBs
+_TIFF_MAX_IFDS = 100000  # page stacks of 10000+ pages exist; each IFD is also charged to the work budget
 
 
 class _Tiff:
@@ -256,7 +256,7 @@ class _Tiff:
         got = self._entries.get(ifd)
         if got is None:
             count = self.u(ifd, 2)
-            self.spend(count)
+            self.spend(count + 1)
             end = ifd + 2 + 12 * count
             if end > len(self.buf):
                 raise WipeError("corrupt TIFF: offset out of range")
@@ -323,6 +323,7 @@ class _Tiff:
             if off_tag in by_tag and len_tag in by_tag:
                 offs = self.values(*by_tag[off_tag])
                 lens = self.values(*by_tag[len_tag])
+                self.spend(len(offs))
                 for o, ln in zip(offs, lens):
                     self.zero(o, ln)
         for tag, (e, typ, cnt, size) in by_tag.items():
@@ -369,10 +370,24 @@ class _Tiff:
             ifd = self.u(ifd + 2 + 12 * len(self.entries(ifd)), 4)
         return chain
 
-    def is_thumbnail(self, ifd: int, position: int) -> bool:
-        """Exif-style JPEG thumbnail: a later IFD that only points at a JPEG stream and has no image of its own."""
-        tags = self.tags_of(ifd).keys()
-        return position > 0 and 513 in tags and not tags & {273, 324, 256, 257}
+    def is_thumbnail(self, chain: list[int], position: int) -> bool:
+        """Exif-style JPEG thumbnail: a later IFD that points at a JPEG stream (513) and has no strips/tiles.
+
+        The first IFD is never one (an old-style JPEG TIFF keeps its only image there). Without
+        ImageWidth/ImageLength any later IFD qualifies; some writers put them into the thumbnail
+        IFD, so the one right after IFD0 (the Exif IFD1 slot) still counts when it is smaller than IFD0.
+        """
+        by = self.tags_of(chain[position])
+        if position == 0 or 513 not in by or by.keys() & {273, 324}:
+            return False
+        if not by.keys() & {256, 257}:
+            return True
+        if position != 1:
+            return False
+        first = self.tags_of(chain[0])
+        w0, h0 = self.scalar(first, 256, 0), self.scalar(first, 257, 0)
+        width, length = self.scalar(by, 256, 0), self.scalar(by, 257, 0)
+        return not (w0 > 0 and h0 > 0 and width >= w0 and length >= h0)
 
     def scalar(self, by: dict, tag: int, default: int) -> int:
         got = self.values(*by[tag]) if tag in by else ()
@@ -389,6 +404,7 @@ class _Tiff:
         if (not 1 <= spp <= 64 or width <= 0 or length <= 0 or not bps or min(bps) <= 0
                 or self.scalar(by, 262, -1) == 6):  # YCbCr is subsampled
             return False
+        self.spend(len(bps))
         bps = (tuple(bps) + (bps[-1],) * spp)[:spp]
         planar = self.scalar(by, 284, 1) == 2
         planes = spp if planar else 1
@@ -425,7 +441,7 @@ class _Tiff:
         size = len(self.buf)
         ranges = [(0, 8)]
         tables, kept_sizes = [], []  # IFD tables are rewritten in place: nothing else may live inside them
-        done = set()
+        done, covered = set(), {}  # shared strip tables: collected once; geometry verdicts per table
         reason = None
         for ifd in kept:
             entries = [x for x in self.entries(ifd) if x[1] in _TIFF_KEEP]
@@ -453,16 +469,26 @@ class _Tiff:
                 if len(offs) != len(lens):
                     reason = reason or "TIFF strip/tile offsets and byte counts disagree"
                     continue
-                geometry = tuple(self.scalar(by, t, 0) for t in (256, 257, 259, 262, 277, 278, 284, 322, 323)) \
-                    + (tuple(self.values(*by[258])) if 258 in by else (),)
+                # a table shared by several IFDs is collected once whatever their geometry is
+                table = None
                 if by[off_tag][3] > 4 and by[len_tag][3] > 4:
-                    key = (off_tag, self.u(by[off_tag][0] + 8, 4), self.u(by[len_tag][0] + 8, 4), len(offs), geometry)
-                    if key in done:  # IFDs sharing one table are checked once
+                    table = (off_tag, by[off_tag][1], self.u(by[off_tag][0] + 8, 4),
+                             by[len_tag][1], self.u(by[len_tag][0] + 8, 4), len(offs))
+                if off_tag != 513 and self.scalar(by, 259, 1) == 1:
+                    bits = by.get(258)
+                    geometry = tuple(self.scalar(by, t, 0) for t in (256, 257, 262, 277, 278, 284, 322, 323)) \
+                        + (bits[1:3] + (bytes(self.buf[bits[0] + 8:bits[0] + 12]),) if bits else (),)
+                    if (table, geometry) not in covered or table is None:
+                        if table in done:  # same table, other geometry: the check scans it again
+                            self.spend(len(lens))
+                        covered[table, geometry] = self.counts_cover_geometry(by, off_tag == 324, lens)
+                    if not covered[table, geometry]:
+                        reason = reason or "TIFF byte counts do not match the image geometry"
+                if table is not None:
+                    if table in done:
                         continue
-                    done.add(key)
-                if off_tag != 513 and self.scalar(by, 259, 1) == 1 and \
-                        not self.counts_cover_geometry(by, off_tag == 324, lens):
-                    reason = reason or "TIFF byte counts do not match the image geometry"
+                    done.add(table)
+                self.spend(2 * len(offs))  # every range is a tuple: heavier than a parsed value
                 for o, ln in zip(offs, lens):
                     if not ln:
                         if o:
@@ -514,7 +540,7 @@ def clean_tiff(data: bytes, note=None) -> bytes:
     chain = t.ifd_chain()
     if not chain:
         raise WipeError("corrupt TIFF: no image IFD")
-    kept_ifds = [ifd for n, ifd in enumerate(chain) if not t.is_thumbnail(ifd, n)]
+    kept_ifds = [ifd for n, ifd in enumerate(chain) if not t.is_thumbnail(chain, n)]
     ranges, reason = t.referenced(kept_ifds)  # read-only analysis of the original structure
     t.protect(ranges)
     old_jpeg = any(513 in t.tags_of(ifd) or t.scalar(t.tags_of(ifd), 259, 1) == 6 for ifd in kept_ifds)

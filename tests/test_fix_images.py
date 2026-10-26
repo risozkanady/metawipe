@@ -410,7 +410,7 @@ class TiffBudgets(Base):
         self.assertLess(time.time() - t, 10)  # was about 70 ms per IFD and no error
 
     def test_ifd_chain_limit(self):
-        n = 10005
+        n = images._TIFF_MAX_IFDS + 5
         buf = bytearray(8 + n * 6)
         buf[:8] = b"II*\x00" + struct.pack("<I", 8)
         for i in range(n):
