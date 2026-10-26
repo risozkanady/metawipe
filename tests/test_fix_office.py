@@ -524,3 +524,16 @@ class WellFormedGuard(Fix):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DanglingRefScanIsLinear(unittest.TestCase):
+    def test_many_hits_inside_one_long_text_run(self):
+        """A dropped relationship id repeated inside a huge text node must not make the tag search quadratic."""
+        ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+        text = (f'<a xmlns:r="{ns}"><t>' + "rId1 " * 400_000 + '</t><p r:id="rId1" k="v"/><p r:id="rId2"/></a>')
+        t0 = time.monotonic()
+        out = office._apply_rules(text, office._Rules(), {"rId1"})
+        self.assertLess(time.monotonic() - t0, 3)
+        self.assertIn('<p k="v"/>', out.replace(' <', "<"))
+        self.assertIn('r:id="rId2"', out)
+        self.assertEqual(out.count("rId1 "), 400_000)

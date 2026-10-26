@@ -448,17 +448,64 @@ class CliFixTests(Base):
         st = p.stat()
         calls = []
         with mock.patch.object(cli.os, "geteuid", return_value=0), \
-                mock.patch.object(cli.os, "chown", side_effect=lambda path, uid, gid: calls.append((Path(path).name, uid, gid))):
+                mock.patch.object(cli.os, "fchown", side_effect=lambda fd, uid, gid: calls.append((uid, gid))):
             rc, out, err = run("-i", p)
         self.assertEqual(rc, 0, out + err)
-        self.assertEqual(len(calls), 1)
-        self.assertTrue(calls[0][0].startswith(".metawipe-"))
-        self.assertEqual(calls[0][1:], (st.st_uid, st.st_gid))
+        self.assertEqual(calls, [(st.st_uid, st.st_gid)])
         calls.clear()
         with mock.patch.object(cli.os, "geteuid", return_value=1000), \
-                mock.patch.object(cli.os, "chown", side_effect=lambda path, uid, gid: calls.append((uid, gid))):
+                mock.patch.object(cli.os, "fchown", side_effect=lambda fd, uid, gid: calls.append((uid, gid))):
             self.assertEqual(run("-i", self.png(p))[0], 0)
         self.assertEqual(calls, [(-1, st.st_gid)])
+
+    @unittest.skipIf(os.name == "nt", "POSIX symlinks")
+    def test_output_swapped_for_symlink_cannot_redirect_chmod_chown_utime(self):
+        """The directory may be controlled by someone else while root cleans: the finished temp file is
+        handled through an O_NOFOLLOW descriptor, so a path swapped for a symlink or hard link is refused."""
+        victim = self.dir / "victim.txt"
+        victim.write_text("keep")
+        victim.chmod(0o640)
+        before = victim.stat()
+        real_handler = cli._handler
+
+        def swapping(src):
+            inner = real_handler(src)
+
+            def run_handler(s, dst, ctx):
+                inner(s, dst, ctx)
+                dst.unlink()
+                dst.symlink_to(victim)
+            return run_handler
+
+        for extra in ((), ("--full",)):
+            p = self.png(self.dir / "a.png")
+            original = p.read_bytes()
+            with mock.patch.object(cli, "_handler", swapping):
+                rc, out, err = run("-i", *extra, p)
+            self.assertEqual(rc, 1, out + err)
+            self.assertNotIn(".metawipe-", out + err)
+            after = victim.stat()
+            self.assertEqual((after.st_mode, after.st_mtime_ns, after.st_uid), (before.st_mode, before.st_mtime_ns, before.st_uid))
+            self.assertEqual(p.read_bytes(), original)
+            self.assertEqual(victim.read_text(), "keep")
+
+        hard = self.dir / "hard.txt"
+        os.link(victim, hard)
+
+        def hardlinking(src):
+            inner = real_handler(src)
+
+            def run_handler(s, dst, ctx):
+                inner(s, dst, ctx)
+                dst.unlink()
+                os.link(victim, dst)
+            return run_handler
+
+        p = self.png(self.dir / "b.png")
+        with mock.patch.object(cli, "_handler", hardlinking):
+            rc, out, err = run("-i", p)
+        self.assertEqual(rc, 1, out + err)
+        self.assertEqual(victim.stat().st_mode, before.st_mode)
 
     @unittest.skipUnless(shutil.which("unshare"), "unshare missing")
     def test_root_in_user_namespace_keeps_owner(self):

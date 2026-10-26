@@ -199,6 +199,33 @@ def _hide_temp(text: str, tmp: Path, dst: Path) -> str:
     return text.replace(tmp.name, dst.name)
 
 
+def _finish(tmp: Path, st: os.stat_result, inplace: bool, full: bool) -> None:
+    """Permissions, owner and mtime of the finished temp file, applied through an open descriptor so a path swapped
+    for a symlink or a hard link (the directory may belong to somebody else when running as root) cannot redirect them."""
+    mode = stat.S_IMODE(st.st_mode) & 0o777  # no setuid/setgid/sticky on outputs
+    if os.name == "nt":
+        os.chmod(tmp, mode)
+        if full:
+            os.utime(tmp, (_FULL_MTIME, _FULL_MTIME))
+        return
+    fd = os.open(tmp, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        mine = os.fstat(fd)
+        if not stat.S_ISREG(mine.st_mode) or mine.st_nlink != 1 or mine.st_uid not in (os.geteuid(), os.getuid()):
+            raise WipeError("the output file was replaced while it was being written")
+        os.fchmod(fd, mode)
+        if inplace:
+            try:
+                # root (sudo): give the file back to its owner; others keep the group where they are allowed to
+                os.fchown(fd, st.st_uid if os.geteuid() == 0 else -1, st.st_gid)
+            except OSError:
+                pass
+        if full:
+            os.utime(fd, (_FULL_MTIME, _FULL_MTIME))
+    finally:
+        os.close(fd)
+
+
 def _run(job: Job, args, warn=None) -> Context:
     ctx = Context(password=args.password, full=args.full,
                   warn=warn or (lambda msg: print(f"warn   {job.src}: {msg}", file=sys.stderr)))
@@ -215,18 +242,7 @@ def _run(job: Job, args, warn=None) -> Context:
         tmp = Path(tmp_name)
         try:
             _handler(job.src)(job.src, tmp, ctx)
-            st = job.src.stat()
-            os.chmod(tmp, stat.S_IMODE(st.st_mode) & 0o777)  # no setuid/setgid/sticky on outputs
-            if job.inplace:
-                try:
-                    if os.geteuid() == 0:
-                        os.chown(tmp, st.st_uid, st.st_gid)  # root (sudo): give the file back to its owner
-                    else:
-                        os.chown(tmp, -1, st.st_gid)  # keep the group where we are allowed to
-                except (OSError, AttributeError):
-                    pass
-            if args.full:
-                os.utime(tmp, (_FULL_MTIME, _FULL_MTIME))
+            _finish(tmp, job.src.stat(), job.inplace, args.full)
             os.replace(tmp, job.dst)
         except WipeError as e:
             raise WipeError(_hide_temp(str(e), tmp, job.dst)) from e

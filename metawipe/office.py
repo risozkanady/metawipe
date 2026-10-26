@@ -396,13 +396,17 @@ def _edit_tags(doc: _Doc, text: str, attrs: list, rel_ids: set) -> str:
         return _TAG.sub(tag, text)
     # only dangling r:id references to remove: visit just the tags that carry one (big worksheets stay fast)
     pieces, pos = [], 0
-    for hit in re.compile("|".join(re.escape(i) for i in sorted(rel_ids))).finditer(text):
-        start = text.rfind("<", 0, hit.start())
-        m = _TAG.match(text, start) if start >= pos else None
+    ids, i = re.compile("|".join(re.escape(r) for r in sorted(rel_ids))), 0
+    while (hit := ids.search(text, i)) is not None:
+        start = text.rfind("<", pos, hit.start())
+        m = _TAG.match(text, start) if start != -1 else None
         if m is None or m.end() <= hit.start():
+            i = text.find("<", hit.end())  # the hit is in text: skip the rest of this text run, scanned once
+            if i == -1:
+                break
             continue
         pieces += [text[pos:start], tag(m)]
-        pos = m.end()
+        pos = i = m.end()
     pieces.append(text[pos:])
     return "".join(pieces)
 
