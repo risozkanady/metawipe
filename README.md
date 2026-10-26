@@ -21,8 +21,7 @@ pip install .            # puts a `metawipe` command in the venv; or use  python
 
 Videos need `ffmpeg` (with `ffprobe`) on the PATH (`brew install ffmpeg`, `pacman -S ffmpeg`, ...);
 `--full` on a video refuses to run without `ffprobe`. Everything else is pure Python.
-The `--full` option and the TUI live on the `testing` branch for now
-(`git clone -b testing ...`, `pip install '.[tui]'` for the TUI).
+For the interactive TUI (`metawipe --tui`) install with `pip install '.[tui]'`.
 
 ## Usage
 
