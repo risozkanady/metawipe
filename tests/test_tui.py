@@ -102,5 +102,73 @@ class TuiTests(unittest.TestCase):
             self.assertIn(SECRET, p.read_bytes())
 
 
+@unittest.skipIf(MetawipeApp is None, "textual missing")
+class TuiDesignTests(unittest.TestCase):
+    def test_severity_ranks_where_and_who_first(self):
+        from metawipe.tui import severity
+        for key in ("GPS", "Artist", "Annotation authors", "Printer name", "Digital signature"):
+            self.assertEqual(severity(key), 0, key)
+        for key in ("Make", "Model", "Software", "XMP", "Thumbnail", "File ID"):
+            self.assertEqual(severity(key), 1, key)
+        for key in ("DateTimeOriginal", "Modification time"):
+            self.assertEqual(severity(key), 2, key)
+
+    def test_run_button_says_what_will_happen_and_outcome_shows_in_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "a.png"
+            p.write_bytes(png_bytes([(b"tEXt", b"k\x00" + SECRET)]))
+            (Path(tmp) / "notes.txt").write_text("hi")
+
+            async def scenario():
+                from textual.widgets import Button
+                app = MetawipeApp(Path(tmp))
+                async with app.run_test(size=(140, 40)) as pilot:
+                    await wait_for_tree(app, pilot)
+                    button = app.query_one("#run", Button)
+                    self.assertEqual(str(button.label), "Clean (r)")
+                    await pilot.press("down")  # a.png
+                    await pilot.press("space")
+                    self.assertEqual(str(button.label), "Clean 1 marked (r)")
+                    app.query_one("#mode", Select).value = "inplace"
+                    await pilot.pause(0.2)
+                    self.assertEqual(str(button.label), "Overwrite 1 marked (r)")
+                    self.assertEqual(str(button.variant), "error")
+                    self.assertTrue(app.query_one("#folder-row").display is False)
+                    app.query_one("#mode", Select).value = "folder"
+                    await pilot.pause(0.2)
+                    self.assertTrue(app.query_one("#folder-row").display)
+                    app.query_one("#mode", Select).value = "copy"
+                    await pilot.press("r")
+                    await pilot.pause(2)
+                    self.assertEqual(app.states.get(p), "done")
+                    self.assertFalse(app.marks)  # the outcome shows in the tree instead
+                    self.assertEqual(str(button.label), "Clean (r)")
+                    # files metawipe cannot handle cannot be marked
+                    await pilot.press("down", "down", "down")
+                    app.marks.clear()
+                    node = app.query_one("#tree").cursor_node
+                    if node is not None and node.data is not None and node.data.path.suffix == ".txt":
+                        await pilot.press("space")
+                        self.assertFalse(app.marks)
+
+            asyncio.run(scenario())
+
+    def test_preview_marks_clean_and_unsupported_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "notes.txt").write_text("hi")
+
+            async def scenario():
+                app = MetawipeApp(Path(tmp))
+                async with app.run_test(size=(120, 30)) as pilot:
+                    await wait_for_tree(app, pilot)
+                    await pilot.press("down")
+                    await pilot.pause(0.8)
+                    table = app.query_one("#preview", DataTable)
+                    self.assertIn("Not supported", str(table.get_row_at(0)[0]))
+                    self.assertEqual(table.border_subtitle, "")
+
+            asyncio.run(scenario())
+
+
 if __name__ == "__main__":
     unittest.main()
