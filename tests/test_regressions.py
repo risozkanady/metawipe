@@ -442,8 +442,6 @@ class VideoRegression(Base):
         self.assertTrue(fake.read_text().startswith("ffconcat"))
 
     def test_cover_art_dropped_and_languages_kept(self):
-        from PIL import Image  # noqa: F401  (cover generated with ffmpeg below)
-
         cover = self.dir / "cover.jpg"
         subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=red:s=32x32", "-frames:v", "1", str(cover)], check=True)
         vid = self.make(self.dir / "v.mp4")

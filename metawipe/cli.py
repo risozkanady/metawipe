@@ -121,7 +121,11 @@ def _collect(args, report: Report) -> list[Job]:
                             report.skip(full, "symlinked directory")
                             dirnames.remove(d)
                         elif out_real and os.path.realpath(full) == out_real:
-                            dirnames.remove(d)
+                            dirnames.remove(d)  # earlier outputs are not inputs; say so for what is in there
+                            for sub, subdirs, files in os.walk(full):
+                                subdirs.sort()
+                                for f in sorted(files):
+                                    report.skip(Path(sub, f), "inside the output directory")
                     for f in sorted(filenames):
                         add(Path(dirpath, f), p, False)
             else:
@@ -188,36 +192,61 @@ def _missing_dirs(path: Path) -> list[Path]:
     return missing
 
 
+def _hide_temp(text: str, tmp: Path, dst: Path) -> str:
+    """Messages name the destination, never our temp file (in any of the spellings tools use)."""
+    for name in sorted({str(tmp.resolve()), os.path.abspath(tmp), str(tmp)}, key=len, reverse=True):
+        text = text.replace(name, str(dst))
+    return text.replace(tmp.name, dst.name)
+
+
 def _run(job: Job, args, warn=None) -> Context:
     ctx = Context(password=args.password, full=args.full,
                   warn=warn or (lambda msg: print(f"warn   {job.src}: {msg}", file=sys.stderr)))
     created = _missing_dirs(job.dst.parent)
     job.dst.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=job.dst.parent, prefix=".metawipe-", suffix=job.src.suffix)
-    os.close(fd)
-    tmp = Path(tmp_name)
+    tmp = None
     ok = False
     try:
         try:
+            fd, tmp_name = tempfile.mkstemp(dir=job.dst.parent, prefix=".metawipe-", suffix=job.src.suffix)
+        except OSError as e:
+            raise WipeError(f"cannot create a file in {job.dst.parent}: {e.strerror or e}") from None
+        os.close(fd)
+        tmp = Path(tmp_name)
+        try:
             _handler(job.src)(job.src, tmp, ctx)
+            st = job.src.stat()
+            os.chmod(tmp, stat.S_IMODE(st.st_mode) & 0o777)  # no setuid/setgid/sticky on outputs
+            if job.inplace:
+                try:
+                    if os.geteuid() == 0:
+                        os.chown(tmp, st.st_uid, st.st_gid)  # root (sudo): give the file back to its owner
+                    else:
+                        os.chown(tmp, -1, st.st_gid)  # keep the group where we are allowed to
+                except (OSError, AttributeError):
+                    pass
+            if args.full:
+                os.utime(tmp, (_FULL_MTIME, _FULL_MTIME))
+            os.replace(tmp, job.dst)
         except WipeError as e:
-            raise WipeError(str(e).replace(tmp_name, str(job.dst))) from e
-        st = job.src.stat()
-        os.chmod(tmp, stat.S_IMODE(st.st_mode) & 0o777)  # no setuid/setgid/sticky on outputs
-        if job.inplace:
-            try:
-                os.chown(tmp, -1, st.st_gid)  # keep the group where we are allowed to
-            except (OSError, AttributeError):
-                pass
-        if args.full:
-            os.utime(tmp, (_FULL_MTIME, _FULL_MTIME))
-        os.replace(tmp, job.dst)
+            raise WipeError(_hide_temp(str(e), tmp, job.dst)) from e
+        except Exception as e:
+            if isinstance(e, OSError):  # e.g. full disk, unwritable directory, destination is a directory
+                if e.filename is not None and _hide_temp(str(e.filename), tmp, job.dst) != str(e.filename):
+                    e.filename = str(job.dst)
+                    if e.filename2 is not None and str(e.filename2) == str(job.dst):
+                        e.filename2 = None
+            text = str(e)
+            if _hide_temp(text, tmp, job.dst) != text:
+                raise WipeError(f"{type(e).__name__}: {_hide_temp(text, tmp, job.dst)}") from e
+            raise
         ok = True
     finally:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
         if not ok:
             for d in created:  # directories this job created and left empty
                 try:
@@ -256,7 +285,7 @@ def main(argv=None) -> int:
     ap.add_argument("-p", "--password", help="password for encrypted PDFs")
     ap.add_argument("--full", action="store_true", help=(
         "full scrub: also anonymise comment/revision authors and dates, clean pictures embedded in "
-        "documents, drop customXml/printer settings, strip encoder SEI from H.264, set mtime to 1980; "
+        "documents, drop customXml/printer settings, remove H.264/HEVC encoder strings (x264/x265 SEI), set mtime to 1980; "
         "exit status 2 if something identifying had to be left"))
     ap.add_argument("-v", "--verbose", action="store_true", help="also list skipped files")
     ap.add_argument("--version", action="version", version=f"metawipe {__version__}")

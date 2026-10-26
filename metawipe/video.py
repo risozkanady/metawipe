@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
 
+from . import sei
 from .common import Context, WipeError
 
 VIDEO_EXT = {".mov", ".mp4", ".m4v", ".3gp"}
@@ -17,65 +19,31 @@ def _file_url(path: Path) -> str:
     return "file:" + str(path.resolve())
 
 
-def _probe(src: Path) -> dict:
+def _probe(src: Path) -> dict | None:
+    """ffprobe's view of the streams; None when ffprobe is not installed."""
     ffprobe = shutil.which("ffprobe")
     if ffprobe is None:
-        return {}
+        return None
     out = subprocess.run(
         [ffprobe, "-v", "error", "-protocol_whitelist", "file", "-f", "mov", "-print_format", "json",
-         "-show_entries", "stream=codec_type,codec_name,color_transfer:stream_tags=language"
+         "-show_entries", "stream=codec_type:stream_tags=language"
          ":stream_disposition=attached_pic:stream_side_data=side_data_type", "-i", _file_url(src)],
-        capture_output=True, text=True,
+        capture_output=True, text=True, errors="replace",
     )
     try:
-        return json.loads(out.stdout)
+        info = json.loads(out.stdout)
     except ValueError:
-        return {}
+        info = None
+    if out.returncode != 0 or not isinstance(info, dict):
+        lines = out.stderr.strip().splitlines()
+        raise WipeError(f"ffprobe cannot read the file: {lines[0] if lines else out.returncode}")
+    return info
 
 
-def _strip_hvcc_sei(path: Path) -> int:
-    """Blank SEI arrays (x265 puts its version/options string there) inside hvcC boxes, in place.
-
-    The shrunk hvcC is followed by a `free` box of the freed size, so no offset in the file moves.
-    Returns the number of SEI arrays removed.
-    """
-    buf = bytearray(path.read_bytes())
-    removed = 0
-    pos = buf.find(b"hvcC")
-    while pos != -1:
-        start = pos - 4
-        size = int.from_bytes(buf[start:pos], "big")
-        end = start + size
-        if start >= 0 and size > 30 and end <= len(buf):
-            header, n_arrays, p = bytes(buf[pos + 4:pos + 26]), buf[pos + 26], pos + 27
-            kept, dropped = [], 0
-            try:
-                for _ in range(n_arrays):
-                    first, count = buf[p], int.from_bytes(buf[p + 1:p + 3], "big")
-                    q = p + 3
-                    for _ in range(count):
-                        q += 2 + int.from_bytes(buf[q:q + 2], "big")
-                    if (first & 0x3F) in (39, 40):
-                        dropped += 1
-                    else:
-                        kept.append(bytes(buf[p:q]))
-                    p = q
-            except IndexError:
-                raise WipeError("corrupt hvcC box")
-            if dropped:
-                payload = header + bytes([len(kept)]) + b"".join(kept)
-                new_size = 8 + len(payload)
-                spare = size - new_size
-                if spare < 8:
-                    raise WipeError("hvcC SEI too small to blank safely")
-                buf[start:end] = (
-                    new_size.to_bytes(4, "big") + b"hvcC" + payload + spare.to_bytes(4, "big") + b"free" + bytes(spare - 8)
-                )
-                removed += dropped
-        pos = buf.find(b"hvcC", pos + 4)
-    if removed:
-        path.write_bytes(bytes(buf))
-    return removed
+# ffmpeg fixes these itself (e.g. two packets with the same DTS in cut or screen-recorded files)
+# and the copy is complete. Every other line on stderr ("partial file", "moov atom not found",
+# "Invalid data found ...") means the input was damaged or not copied completely.
+_BENIGN = re.compile(r"Non-monoton(ic|ous) DTS.*changing to|non monotonically increasing dts.*changing to", re.I)
 
 
 def video(src: Path, dst: Path, ctx: Context) -> None:
@@ -84,6 +52,11 @@ def video(src: Path, dst: Path, ctx: Context) -> None:
         raise WipeError("ffmpeg is required for video files (macOS: brew install ffmpeg)")
     suffix = src.suffix.lower()
     info = _probe(src)
+    if info is None:
+        if ctx.full:
+            raise WipeError("ffprobe is required for --full on video (it comes with ffmpeg)")
+        ctx.warn("ffprobe not found: track languages are not kept and Dolby Vision is not detected")
+        info = {}
     streams = info.get("streams", [])
 
     # Only real video/audio/subtitle streams are mapped (`0:V` leaves out cover art), so timed-metadata
@@ -100,7 +73,6 @@ def video(src: Path, dst: Path, ctx: Context) -> None:
     if any(s.get("codec_type") == "video" and s.get("disposition", {}).get("attached_pic") for s in streams):
         ctx.warn("cover art was dropped")
 
-    codec = next((s.get("codec_name") for s in streams if s in kept and s.get("codec_type") == "video"), "")
     has_dovi = any(
         sd.get("side_data_type", "").startswith("DOVI") for s in streams for sd in s.get("side_data_list", [])
     )
@@ -110,21 +82,8 @@ def video(src: Path, dst: Path, ctx: Context) -> None:
             ctx.warn("Dolby Vision signalling cannot be written into .mov by ffmpeg and is lost (plays as HDR10/HLG base layer)")
         else:
             extra += ["-strict", "unofficial"]  # lets the mp4 muxer write the dvcC/dvvC box
-    if ctx.full:
-        # x264/x265 write their version and settings as "user data" SEI messages. SEI units cannot be
-        # filtered by payload, so all SEI is dropped - except for HDR10, whose mastering-display
-        # metadata lives there as well.
-        hdr10 = any(s.get("color_transfer") == "smpte2084" for s in kept)
-        sei = {"h264": "6", "hevc": "39|40"}.get(codec)
-        if sei and hdr10:
-            ctx.leftover("HDR10 video: encoder SEI messages left in place (they also carry the HDR metadata)")
-        elif sei:
-            extra += ["-bsf:v", f"filter_units=remove_types={sei}"]
-        elif codec:
-            ctx.leftover(f"{codec} video: encoder strings inside the bitstream cannot be removed")
-
     cmd = [
-        ffmpeg, "-nostdin", "-v", "error", "-xerror", "-y", "-protocol_whitelist", "file", "-f", "mov",
+        ffmpeg, "-nostdin", "-v", "error", "-y", "-protocol_whitelist", "file", "-f", "mov",
         "-i", _file_url(src),
         "-map", "0:V?", "-map", "0:a?", "-map", "0:s?",
         "-map_metadata", "-1", "-map_chapters", "-1",
@@ -132,9 +91,11 @@ def video(src: Path, dst: Path, ctx: Context) -> None:
         "-fflags", "+bitexact", "-flags:v", "+bitexact", "-flags:a", "+bitexact",
         "-movflags", "+faststart", "-f", _OUTPUT_FORMAT[suffix], _file_url(dst),
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    complaint = proc.stderr.strip().splitlines()[0] if proc.stderr.strip() else ""
-    if proc.returncode != 0 or complaint:
-        raise WipeError(f"ffmpeg failed: {complaint or proc.returncode}")
-    if codec == "hevc" and ctx.full:
-        _strip_hvcc_sei(dst)
+    proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+    problems = [line for line in proc.stderr.splitlines() if line.strip() and not _BENIGN.search(line)]
+    if proc.returncode != 0 or problems:
+        raise WipeError(f"ffmpeg failed: {problems[0] if problems else proc.returncode}")
+    if ctx.full:
+        # x264/x265 write their version and settings as user-data SEI messages into the bitstream
+        # (and x265 also into hvcC); they are overwritten in place, all other SEI is kept.
+        sei.scrub(dst, ctx)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import struct
 import zlib
+from bisect import bisect_left
 from pathlib import Path
 
 from .common import Context, WipeError, minimal_tiff, tiff_orientation
@@ -103,6 +104,7 @@ _PNG_KEEP = {
     b"IHDR", b"PLTE", b"IDAT", b"IEND", b"tRNS",
     b"gAMA", b"cHRM", b"sRGB", b"iCCP", b"cICP", b"mDCV", b"cLLI", b"sBIT", b"pHYs", b"bKGD",
     b"acTL", b"fcTL", b"fdAT",
+    b"orNT",  # ImageMagick's private orientation chunk: one byte, nothing identifying
 }
 
 
@@ -210,16 +212,27 @@ _TIFF_SUBIFD_TAGS = {330, 34665, 34853, 40965}
 _TIFF_DATA_TAGS = ((273, 279), (324, 325), (513, 514))  # (offsets, byte counts)
 _TIFF_TABLE_TAGS = {519, 520, 521}  # offsets to JPEG tables of unknown length
 _TIFF_TYPE_SIZE = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8, 13: 4, 16: 8, 17: 8, 18: 8}
+_TIFF_VALUE_CODE = {1: "B", 3: "H", 4: "I", 13: "I"}
+_TIFF_MAX_WORK = 2_000_000  # entries + values parsed per file; crafted files could otherwise cost hours or GBs
+_TIFF_MAX_IFDS = 10000
 
 
 class _Tiff:
     def __init__(self, data: bytes):
         self.buf = bytearray(data)
         self.budget = 4 * len(data) + (1 << 20)  # bytes we may zero; guards crafted overlapping data
+        self.work = 0
+        self.seen: set = set()  # IFDs that are kept or already erased by the fallback
+        self.protect([])
+        self._entries: dict = {}
+        self._by: dict = {}
+        self._values: dict = {}
         if data[:2] == b"II":
             self.order = "little"
+            self.fmt = "<"
         elif data[:2] == b"MM":
             self.order = "big"
+            self.fmt = ">"
         else:
             raise WipeError("not a TIFF file")
         magic = self.u(2, 2)
@@ -233,72 +246,111 @@ class _Tiff:
             raise WipeError("corrupt TIFF: offset out of range")
         return int.from_bytes(self.buf[off:off + size], self.order)
 
-    def entries(self, ifd: int):
-        count = self.u(ifd, 2)
-        for n in range(count):
-            e = ifd + 2 + 12 * n
-            tag, typ, cnt = self.u(e, 2), self.u(e + 2, 2), self.u(e + 4, 4)
-            size = _TIFF_TYPE_SIZE.get(typ, 1) * cnt
-            yield e, tag, typ, cnt, size
+    def spend(self, n: int) -> None:
+        self.work += n
+        if self.work > _TIFF_MAX_WORK:
+            raise WipeError("corrupt TIFF: too many entries")
 
-    def values(self, e: int, typ: int, cnt: int, size: int) -> list[int]:
-        if typ not in (1, 3, 4, 13):
-            return []
-        base = e + 8 if size <= 4 else self.u(e + 8, 4)
+    def entries(self, ifd: int) -> list:
+        """(entry offset, tag, type, count, byte size) for every entry of an IFD; parsed once."""
+        got = self._entries.get(ifd)
+        if got is None:
+            count = self.u(ifd, 2)
+            self.spend(count)
+            end = ifd + 2 + 12 * count
+            if end > len(self.buf):
+                raise WipeError("corrupt TIFF: offset out of range")
+            got = [(ifd + 2 + 12 * n, tag, typ, cnt, _TIFF_TYPE_SIZE.get(typ, 1) * cnt)
+                   for n, (tag, typ, cnt) in enumerate(struct.iter_unpack(self.fmt + "HHI4x", self.buf[ifd + 2:end]))]
+            self._entries[ifd] = got
+        return got
+
+    def tags_of(self, ifd: int) -> dict:
+        got = self._by.get(ifd)
+        if got is None:
+            got = self._by[ifd] = {tag: (e, typ, cnt, size) for e, tag, typ, cnt, size in self.entries(ifd)}
+        return got
+
+    def values(self, e: int, typ: int, cnt: int, size: int) -> tuple:
+        """Integer values of an entry (BYTE/SHORT/LONG/IFD only); shared arrays are read once."""
+        code = _TIFF_VALUE_CODE.get(typ)
+        if code is None:
+            return ()
         step = _TIFF_TYPE_SIZE[typ]
-        if cnt > len(self.buf):
-            raise WipeError("corrupt TIFF: implausible value count")
-        return [self.u(base + k * step, step) for k in range(cnt)]
+        base = e + 8 if size <= 4 else self.u(e + 8, 4)
+        key = (base, typ, cnt)
+        got = self._values.get(key) if size > 4 else None
+        if got is None:
+            if size > len(self.buf):
+                raise WipeError("corrupt TIFF: implausible value count")
+            if base + size > len(self.buf):
+                raise WipeError("truncated TIFF")
+            self.spend(cnt)
+            got = struct.unpack_from(f"{self.fmt}{cnt}{code}", self.buf, base)
+            if size > 4:
+                self._values[key] = got
+        return got
+
+    def protect(self, ranges: list) -> None:
+        """Remember what the kept structure uses; the fallback eraser must never touch it."""
+        self._protected = sorted(ranges)
+        self._starts = [a for a, _ in self._protected]
+        self._reach, top = [], 0
+        for _, b in self._protected:
+            top = max(top, b)
+            self._reach.append(top)
 
     def zero(self, off: int, size: int) -> None:
-        if size <= 0 or off < 0:
-            return
-        size = min(size, len(self.buf) - off)
         if size <= 0:
             return
+        if off < 0 or off + size > len(self.buf):
+            raise WipeError("truncated TIFF")
+        i = bisect_left(self._starts, off + size)
+        if i and self._reach[i - 1] > off:
+            raise WipeError("corrupt TIFF: overlapping data")
         self.budget -= size
         if self.budget < 0:
             raise WipeError("corrupt TIFF: overlapping data")
         self.buf[off:off + size] = bytes(size)
 
-    def zero_ifd(self, ifd: int, seen: set, depth: int = 0) -> None:
+    def zero_ifd(self, ifd: int, depth: int = 0) -> None:
         """Fallback eraser: an IFD, its out-of-line values, nested IFDs and the strips it points to."""
-        if depth > 8 or ifd == 0 or ifd in seen or ifd + 2 > len(self.buf):
+        if depth > 8 or ifd == 0 or ifd in self.seen or ifd + 2 > len(self.buf):
             return
-        seen.add(ifd)
-        count = self.u(ifd, 2)
-        by_tag = {tag: (e, typ, cnt, size) for e, tag, typ, cnt, size in self.entries(ifd)}
+        self.seen.add(ifd)
+        by_tag = self.tags_of(ifd)
         for off_tag, len_tag in _TIFF_DATA_TAGS:
             if off_tag in by_tag and len_tag in by_tag:
-                offs = self.values(by_tag[off_tag][0], *by_tag[off_tag][1:])
-                lens = self.values(by_tag[len_tag][0], *by_tag[len_tag][1:])
+                offs = self.values(*by_tag[off_tag])
+                lens = self.values(*by_tag[len_tag])
                 for o, ln in zip(offs, lens):
                     self.zero(o, ln)
         for tag, (e, typ, cnt, size) in by_tag.items():
             if tag in _TIFF_SUBIFD_TAGS:
                 for sub in self.values(e, typ, cnt, size):
-                    self.zero_ifd(sub, seen, depth + 1)
+                    self.zero_ifd(sub, depth + 1)
             if size > 4:
                 self.zero(self.u(e + 8, 4), size)
-        self.zero(ifd, 2 + 12 * count + 4)
+        self.zero(ifd, 2 + 12 * len(self.entries(ifd)) + 4)
 
     def clean_ifd(self, ifd: int, zero_dropped: bool) -> tuple[int, int]:
         """Remove non-whitelisted tags in place; return (next IFD offset, position of its pointer)."""
-        count = self.u(ifd, 2)
-        old_end = ifd + 2 + 12 * count
+        entries = self.entries(ifd)
+        old_end = ifd + 2 + 12 * len(entries)
         next_ifd = self.u(old_end, 4)
         kept = []
-        for e, tag, typ, cnt, size in list(self.entries(ifd)):
+        for e, tag, typ, cnt, size in entries:
             if tag in _TIFF_KEEP:
                 kept.append(bytes(self.buf[e:e + 12]))
                 continue
             if zero_dropped:
                 if tag in _TIFF_SUBIFD_TAGS:
-                    seen: set = set()
                     for sub in self.values(e, typ, cnt, size):
-                        self.zero_ifd(sub, seen)
+                        self.zero_ifd(sub)
                 if size > 4:
                     self.zero(self.u(e + 8, 4), size)
+        self._entries.pop(ifd, None)
+        self._by.pop(ifd, None)
         self.buf[ifd + 2:old_end + 4] = bytes(old_end + 4 - ifd - 2)
         self.buf[ifd:ifd + 2] = len(kept).to_bytes(2, self.order)
         for n, entry in enumerate(kept):
@@ -309,78 +361,180 @@ class _Tiff:
 
     def ifd_chain(self) -> list[int]:
         chain, seen, ifd = [], set(), self.u(4, 4)
-        while ifd and ifd not in seen and len(seen) < 100000:
+        while ifd and ifd not in seen:
+            if len(chain) >= _TIFF_MAX_IFDS:
+                raise WipeError("corrupt TIFF: too many IFDs")
             seen.add(ifd)
             chain.append(ifd)
-            ifd = self.u(ifd + 2 + 12 * self.u(ifd, 2), 4)
+            ifd = self.u(ifd + 2 + 12 * len(self.entries(ifd)), 4)
         return chain
 
-    def tags_of(self, ifd: int) -> dict:
-        return {tag: (e, typ, cnt, size) for e, tag, typ, cnt, size in self.entries(ifd)}
+    def is_thumbnail(self, ifd: int, position: int) -> bool:
+        """Exif-style JPEG thumbnail: a later IFD that only points at a JPEG stream and has no image of its own."""
+        tags = self.tags_of(ifd).keys()
+        return position > 0 and 513 in tags and not tags & {273, 324, 256, 257}
 
-    def referenced(self, ifds: list[int]):
-        """Byte ranges used by the kept structure, or None when some extent cannot be known."""
+    def scalar(self, by: dict, tag: int, default: int) -> int:
+        got = self.values(*by[tag]) if tag in by else ()
+        return got[0] if got else default
+
+    def counts_cover_geometry(self, by: dict, tiled: bool, lens: tuple) -> bool:
+        """Uncompressed data only: do the byte counts hold at least what width/height/depth require?
+
+        libtiff repairs bogus counts for uncompressed images, so a zero or too small count must not
+        make the sweep wipe pixel data. Anything that cannot be verified counts as not covered.
+        """
+        width, length, spp = self.scalar(by, 256, 0), self.scalar(by, 257, 0), self.scalar(by, 277, 1)
+        bps = self.values(*by[258]) if 258 in by else (1,)
+        if (not 1 <= spp <= 64 or width <= 0 or length <= 0 or not bps or min(bps) <= 0
+                or self.scalar(by, 262, -1) == 6):  # YCbCr is subsampled
+            return False
+        bps = (tuple(bps) + (bps[-1],) * spp)[:spp]
+        planar = self.scalar(by, 284, 1) == 2
+        planes = spp if planar else 1
+        if tiled:
+            tw, tl = self.scalar(by, 322, 0), self.scalar(by, 323, 0)
+            if tw <= 0 or tl <= 0:
+                return False
+            per_plane = -(-width // tw) * -(-length // tl)
+        else:
+            rps = self.scalar(by, 278, length)
+            if rps <= 0 or rps > length:
+                rps = length
+            per_plane = -(-length // rps)
+        if len(lens) != per_plane * planes:
+            return False
+        for p in range(planes):
+            bits = bps[p] if planar else sum(bps)
+            chunk = lens[p * per_plane:(p + 1) * per_plane]
+            if tiled:
+                if min(chunk) < -(-tw * bits // 8) * tl:
+                    return False
+                continue
+            row = -(-width * bits // 8)
+            if len(chunk) > 1 and min(chunk[:-1]) < rps * row:
+                return False
+            if chunk[-1] < (length - (per_plane - 1) * rps) * row:
+                return False
+        return True
+
+    def referenced(self, kept: list[int]):
+        """(ranges, reason): byte ranges used by the kept structure, and why they cannot be trusted
+        (None when they can, so that everything outside them may be erased). Anything that points
+        beyond the end of the file raises WipeError."""
+        size = len(self.buf)
         ranges = [(0, 8)]
-        for ifd in ifds:
-            by = self.tags_of(ifd)
-            ranges.append((ifd, ifd + 2 + 12 * self.u(ifd, 2) + 4))
-            if by.keys() & _TIFF_TABLE_TAGS:
-                return None
-            for e, typ, cnt, size in by.values():
-                if size > 4:
+        tables, kept_sizes = [], []  # IFD tables are rewritten in place: nothing else may live inside them
+        done = set()
+        reason = None
+        for ifd in kept:
+            entries = [x for x in self.entries(ifd) if x[1] in _TIFF_KEEP]
+            tables.append((ifd, ifd + 2 + 12 * len(self.entries(ifd)) + 4))
+            kept_sizes.append((ifd, len(entries)))
+            by = {tag: (e, typ, cnt, sz) for e, tag, typ, cnt, sz in entries}
+            for e, tag, typ, cnt, sz in entries:
+                if sz > 4:
                     off = self.u(e + 8, 4)
-                    ranges.append((off, off + size))
+                    if off + sz > size:
+                        raise WipeError("truncated TIFF")
+                    ranges.append((off, off + sz))
+            if by.keys() & _TIFF_TABLE_TAGS:
+                reason = reason or "TIFF uses old-style JPEG tables"
             for off_tag, len_tag in _TIFF_DATA_TAGS:
                 if off_tag not in by:
                     continue
                 if len_tag not in by:
-                    return None
-                offs = self.values(by[off_tag][0], *by[off_tag][1:])
-                lens = self.values(by[len_tag][0], *by[len_tag][1:])
+                    reason = reason or "TIFF has strips/tiles without byte counts"
+                    continue
+                if by[off_tag][1] not in (3, 4) or by[len_tag][1] not in (3, 4):
+                    reason = reason or "TIFF strip/tile tables have an unsupported type"
+                    continue
+                offs, lens = self.values(*by[off_tag]), self.values(*by[len_tag])
                 if len(offs) != len(lens):
-                    return None
-                ranges.extend((o, o + ln) for o, ln in zip(offs, lens))
-        return ranges
+                    reason = reason or "TIFF strip/tile offsets and byte counts disagree"
+                    continue
+                geometry = tuple(self.scalar(by, t, 0) for t in (256, 257, 259, 262, 277, 278, 284, 322, 323)) \
+                    + (tuple(self.values(*by[258])) if 258 in by else (),)
+                if by[off_tag][3] > 4 and by[len_tag][3] > 4:
+                    key = (off_tag, self.u(by[off_tag][0] + 8, 4), self.u(by[len_tag][0] + 8, 4), len(offs), geometry)
+                    if key in done:  # IFDs sharing one table are checked once
+                        continue
+                    done.add(key)
+                if off_tag != 513 and self.scalar(by, 259, 1) == 1 and \
+                        not self.counts_cover_geometry(by, off_tag == 324, lens):
+                    reason = reason or "TIFF byte counts do not match the image geometry"
+                for o, ln in zip(offs, lens):
+                    if not ln:
+                        if o:
+                            reason = reason or "TIFF has empty strips/tiles with an offset"
+                        continue  # sparse tile
+                    if o + ln > size:
+                        raise WipeError("truncated TIFF")
+                    ranges.append((o, o + ln))
+        self.check_tables_disjoint(tables, ranges)
+        return ranges + [(ifd, ifd + 2 + 12 * n + 4) for ifd, n in kept_sizes], reason
+
+    @staticmethod
+    def check_tables_disjoint(tables: list, ranges: list) -> None:
+        """Compacting an IFD would corrupt strips/values/IFDs that overlap it (crafted or damaged files)."""
+        ordered = sorted(ranges)
+        starts = [a for a, _ in ordered]
+        reach, top = [], 0
+        for _, b in ordered:
+            top = max(top, b)
+            reach.append(top)
+        for a, b in tables:
+            i = bisect_left(starts, b)  # ranges starting at or after b cannot overlap
+            if i and reach[i - 1] > a:
+                raise WipeError("corrupt TIFF: overlapping structures")
+        tables = sorted(tables)
+        if any(tables[k][0] < tables[k - 1][1] for k in range(1, len(tables))):
+            raise WipeError("corrupt TIFF: overlapping structures")
 
     def sweep(self, ranges) -> None:
         """Zero every byte that the kept structure does not reference (stale tag values, old IFDs, thumbnails)."""
+        size = len(self.buf)
         pos = 0
-        for start, end in sorted((max(0, a), min(len(self.buf), b)) for a, b in ranges):
+        for start, end in sorted(ranges):
             if start > pos:
                 self.buf[pos:start] = bytes(start - pos)
             pos = max(pos, end)
-        if pos < len(self.buf):
-            self.buf[pos:] = bytes(len(self.buf) - pos)
+        if pos < size:
+            self.buf[pos:] = bytes(size - pos)
+        if len(self.buf) != size:
+            raise WipeError("internal error: TIFF size changed while cleaning")
 
 
 def clean_tiff(data: bytes, note=None) -> bytes:
-    """Whitelist TIFF tags, unlink thumbnail-only IFDs, then zero all bytes nothing references any more."""
+    """Whitelist TIFF tags, unlink thumbnail-only IFDs, then zero all bytes nothing references any more.
+
+    `note` receives a message for everything identifying that could not be erased.
+    """
     t = _Tiff(data)
     chain = t.ifd_chain()
-    sweepable = True
-    for ifd in chain:
-        by = t.tags_of(ifd)
-        if by.keys() & _TIFF_TABLE_TAGS or any(o in by and l not in by for o, l in _TIFF_DATA_TAGS):
-            sweepable = False
+    if not chain:
+        raise WipeError("corrupt TIFF: no image IFD")
+    kept_ifds = [ifd for n, ifd in enumerate(chain) if not t.is_thumbnail(ifd, n)]
+    ranges, reason = t.referenced(kept_ifds)  # read-only analysis of the original structure
+    t.protect(ranges)
+    old_jpeg = any(513 in t.tags_of(ifd) or t.scalar(t.tags_of(ifd), 259, 1) == 6 for ifd in kept_ifds)
+    keep = set(kept_ifds)
+    t.seen = set(keep)
     ptr_pos = 4
-    kept_ifds = []
     for ifd in chain:
-        tags = t.tags_of(ifd).keys()
-        next_ifd = t.u(ifd + 2 + 12 * t.u(ifd, 2), 4)
-        if 513 in tags and not (tags & {273, 324}):  # Exif-style JPEG thumbnail, not a page
+        if ifd not in keep:  # Exif-style JPEG thumbnail, not a page
+            next_ifd = t.u(ifd + 2 + 12 * len(t.entries(ifd)), 4)
             t.buf[ptr_pos:ptr_pos + 4] = next_ifd.to_bytes(4, t.order)
-            if not sweepable:
-                t.zero_ifd(ifd, set())
+            if reason:
+                t.zero_ifd(ifd)
             continue
-        next_ifd, ptr_pos = t.clean_ifd(ifd, zero_dropped=not sweepable)
-        kept_ifds.append(ifd)
-    if sweepable:
-        ranges = t.referenced(kept_ifds)
-        if ranges is None:
-            raise WipeError("corrupt TIFF: inconsistent strip/tile tables")
+        next_ifd, ptr_pos = t.clean_ifd(ifd, zero_dropped=bool(reason))
+    if not reason:
         t.sweep(ranges)
     elif note:
-        note("TIFF uses old-style JPEG tables; stale data between structures could not be erased")
+        note(f"{reason}; stale data between structures could not be erased")
+    if note and old_jpeg:
+        note("TIFF holds an old-style JPEG stream; Exif/XMP/comment segments inside it were not cleaned")
     return bytes(t.buf)
 
 
@@ -398,7 +552,7 @@ webp = _bytes_handler(clean_webp)
 
 
 def tiff(src: Path, dst: Path, ctx: Context) -> None:
-    dst.write_bytes(clean_tiff(src.read_bytes(), ctx.warn))
+    dst.write_bytes(clean_tiff(src.read_bytes(), ctx.leftover))
 
 
 # By extension, for pictures embedded in other documents.

@@ -3,7 +3,8 @@
 Removing boxes would shift the absolute offsets stored in `iloc`, so metadata is neutralised in
 place instead: Exif/XMP item payloads are overwritten with zeros, their item type is changed to
 the unknown type `free` (readers skip unknown item types) and stray xml/uuid/free boxes are
-blanked. File size, offsets and the coded images stay exactly as they were.
+blanked. Free-text name fields (handler names, compressor names, item names) are overwritten too.
+File size, offsets and the coded images stay exactly as they were.
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ from .common import Context, WipeError
 
 _BLANK_BOXES = {b"xml ", b"bxml", b"uuid", b"free", b"skip"}
 _XMP_TYPES = (b"application/rdf+xml",)
+_VISUAL_HANDLERS = (b"vide", b"pict", b"auxv")
 
 
 def _boxes(buf: bytearray, start: int, end: int):
@@ -114,16 +116,54 @@ def _iloc_extents(buf: bytearray, payload: int, end: int, wanted: set[int]) -> d
     return result
 
 
-def _clean_moov(buf: bytearray, start: int, end: int) -> None:
-    """Image sequences keep movie-style boxes: zero creation/modification times, blank udta/meta."""
+def _blank_hdlr_name(buf: bytearray, payload: int, end: int) -> None:
+    """The handler name (free text) follows 24 bytes of fixed fields; zeroing it keeps the box size."""
+    if payload + 24 < end:
+        _blank(buf, payload + 24, end)
+
+
+def _blank_item_name(buf: bytearray, pos: int, end: int, keep_structure: bool) -> None:
+    """Overwrite an infe item_name up to (not including) its terminating NUL.
+
+    Strings that follow the name (content type, URI type) are located by that NUL, so for such items
+    the name is filled with spaces instead of zeros to leave them where they are.
+    """
+    stop = buf.find(b"\x00", pos, end)
+    if stop == -1:
+        stop = end
+    buf[pos:stop] = (b" " if keep_structure else b"\x00") * (stop - pos)
+
+
+def _clean_stsd(buf: bytearray, payload: int, end: int) -> None:
+    """Visual sample entries carry a 32-byte free-text compressor name (encoder strings such as 'Lavc...')."""
+    for _, _, entry, entry_end in _boxes(buf, payload + 8, end):
+        if entry + 8 + 34 + 32 <= entry_end:
+            _blank(buf, entry + 8 + 34, entry + 8 + 34 + 32)
+
+
+def _handler_type(buf: bytearray, start: int, end: int) -> bytes:
+    for btype, _, payload, box_end in _boxes(buf, start, end):
+        if btype == b"hdlr" and payload + 12 <= box_end:
+            return bytes(buf[payload + 8:payload + 12])
+    return b""
+
+
+def _clean_moov(buf: bytearray, start: int, end: int, handler: bytes = b"") -> None:
+    """Image sequences keep movie-style boxes: zero creation/modification times, handler and
+    compressor names, blank udta/meta."""
     for btype, box_start, payload, box_end in _boxes(buf, start, end):
         if btype in (b"mvhd", b"tkhd", b"mdhd"):
             _blank(buf, payload + 4, payload + (20 if buf[payload] == 1 else 12))
         elif btype in (b"udta", b"meta"):
             _blank(buf, payload, box_end)
             buf[box_start + 4:box_start + 8] = b"free"
-        elif btype in (b"trak", b"mdia"):
-            _clean_moov(buf, payload, box_end)
+        elif btype == b"hdlr":
+            _blank_hdlr_name(buf, payload, box_end)
+        elif btype == b"stsd":
+            if handler in _VISUAL_HANDLERS:
+                _clean_stsd(buf, payload, box_end)
+        elif btype in (b"trak", b"mdia", b"minf", b"stbl"):
+            _clean_moov(buf, payload, box_end, _handler_type(buf, payload, box_end) if btype == b"mdia" else handler)
 
 
 def clean_heif(data: bytes) -> bytes:
@@ -157,11 +197,15 @@ def clean_heif(data: bytes) -> bytes:
                     continue
                 info = _parse_infe(buf, pp, be)
                 if info is None:
+                    if pp + 8 <= be:  # version 0/1: item_name follows id and protection index
+                        _blank_item_name(buf, pp + 8, be, True)
                     continue
                 item_id, item_type, type_pos, tail = info
                 is_xmp = item_type == b"mime" and any(t in bytes(buf[tail:be]) for t in _XMP_TYPES)
                 if item_type == b"Exif" or is_xmp:
                     unwanted[item_id] = (type_pos, tail, be, item_id)
+                else:
+                    _blank_item_name(buf, tail, be, item_type in (b"mime", b"uri "))
         if unwanted:
             if b"iloc" not in by_type:
                 raise WipeError("corrupt HEIF: metadata items without iloc")
@@ -185,6 +229,8 @@ def clean_heif(data: bytes) -> bytes:
             if btype in _BLANK_BOXES:
                 _blank(buf, pp, be)
                 buf[bs + 4:bs + 8] = b"free"
+            elif btype == b"hdlr":
+                _blank_hdlr_name(buf, pp, be)
             elif btype == b"iprp":
                 for ptype, ps, pp2, pe in _boxes(buf, pp, be):
                     if ptype != b"ipco":
