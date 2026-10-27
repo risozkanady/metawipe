@@ -5,6 +5,8 @@ import contextlib
 import logging
 import struct
 import sys
+import unicodedata
+from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -13,17 +15,42 @@ class WipeError(Exception):
     """The file could not be cleaned safely (malformed, unsupported variant, missing tool)."""
 
 
+# what --keep (and the TUI's Keep switches) can leave in a file; everything not kept is still removed
+KEEP = ("dates", "location", "device", "software", "people", "descriptions", "thumbnails")
+
+
+def text_ok(v, cap: int) -> bool:
+    """A kept text value: a non-blank string within cap, with no control, line-break or bidi-override characters."""
+    return (isinstance(v, str) and 0 < len(v.strip()) <= cap and not any(
+        unicodedata.category(c) in ("Cc", "Cs", "Zl", "Zp") or "\u202a" <= c <= "\u202e" or "\u2066" <= c <= "\u2069" for c in v))
+
+
+def real_date(y, mo, d, h=0, mi=0, s=0) -> bool:
+    """Whether the numbers (ints or digit strings, missing = 0) are a real calendar date and time."""
+    try:
+        datetime(int(y), int(mo), int(d), int(h or 0), int(mi or 0), int(s or 0))
+        return True
+    except ValueError:
+        return False
+
+
 @dataclass
 class Context:
     password: str | None = None
     warn: Callable[[str], None] = field(default=lambda msg: print(f"warn   {msg}", file=sys.stderr))
     full: bool = False
     residue: list = field(default_factory=list)
+    keep: frozenset = frozenset()  # categories from KEEP the user asked to keep
+    kept: set = field(default_factory=set)  # categories this file really kept (reported next to the file)
 
     def leftover(self, msg: str) -> None:
         """Something identifying that this run could not remove (full mode reports the file as incomplete)."""
         self.residue.append(msg)
         self.warn(msg)
+
+    def cannot_keep(self, category: str, why: str) -> None:
+        """A kept category this format cannot carry over: it was removed as usual (not residue)."""
+        self.warn(f"{category} not kept: {why}")
 
 
 @contextlib.contextmanager

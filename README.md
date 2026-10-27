@@ -37,7 +37,7 @@ Videos need `ffmpeg` (with `ffprobe`) on the PATH (`brew install ffmpeg`, `pacma
 For the interactive TUI (`metawipe --tui`) install with `pip install '.[tui]'`.
 In the TUI, `v` switches the preview between what the file reveals and everything it carries.
 The file tree reloads after every run (and on `F5`), so new `NAME.clean.EXT` copies and output folders show up.
-`s` opens the settings (theme, clock with date, hidden files, preview mode, remember the cleaning options); every change
+`s` opens the settings (theme, clock with date, hidden files, preview mode, remember the cleaning options, the Keep switches); every change
 is saved at once in `~/.config/metawipe/config.json` (`$XDG_CONFIG_HOME` is respected).
 
 ## Usage
@@ -47,12 +47,13 @@ metawipe photo.jpg report.pdf          # writes photo.clean.jpg and report.clean
 metawipe -i -r ~/Pictures/trip         # overwrite originals, recursively
 metawipe -r -o cleaned/ ~/Documents    # cleaned copies in cleaned/, same folder structure
 metawipe -p secret locked.pdf          # password for encrypted PDFs
+metawipe --keep dates photo.jpg        # keep the dates, wipe everything else (see "Keeping some metadata")
 metawipe --show photo.jpg              # list everything the file carries, writes nothing (-r for folders)
 ```
 
 - Existing output files are never overwritten unless you pass `-f`.
 - `-i` refuses symlinks and hard-linked files (the other names would keep the metadata).
-- File permissions are preserved (setuid/setgid/sticky bits are not); modification time is "now".
+- File permissions are preserved (setuid/setgid/sticky bits are not); modification time is "now" (the original's with `--keep dates`).
   When run as root, `-i` gives the file back to its original owner and group.
 - Exit status is 1 if any file failed or was an explicit argument of an unsupported type.
   Unsupported files found while scanning a directory are only counted (`-v` lists them).
@@ -66,6 +67,29 @@ metawipe --show photo.jpg              # list everything the file carries, write
 - PNG orientation, also in ImageMagick's private `orNT` chunk.
 - HEIF/AVIF handler, compressor and item names are blanked in place (size and offsets unchanged).
 - Digital signatures (PDF, Office, ODF) are removed, because cleaning invalidates them anyway.
+
+## Keeping some metadata (`--keep`)
+
+Everything is wiped by default. `--keep LIST` (comma-separated, or `all`) leaves some kinds in:
+`dates`, `location`, `device`, `software`, `people`, `descriptions`, `thumbnails`.
+
+```
+metawipe --keep dates photo.jpg
+metawipe --keep dates,descriptions report.pdf
+```
+
+- Kept values are copied one by one into a fresh minimal structure, never a whole Exif/XMP/Info block; each value is
+  checked (dates must parse, text is length-limited and free of control characters) and dropped if it does not pass.
+- `dates` also keeps the file's modification time (instead of "now", or 1980 with `--full`).
+- `device` means make, model and lens, **including the body and lens serial numbers**, which identify one exact camera.
+- Each cleaned file reports what really stayed: `clean photo.jpg photo.clean.jpg (kept: dates)`. A format that has a kept
+  kind but cannot carry it in this version removes it and prints a warning (`dates not kept: ...`).
+- With `--full`, a kept kind is also spared by the full-scrub step for it: comment/revision authors (`people`), their
+  dates (`dates`), the x264/x265 SEI strings (`software`) and PDF page thumbnails (`thumbnails`) stay as they are.
+- **Never kept:** the camera MakerNote, XMP and IPTC (in this version, so a kept kind that also sits in XMP/IPTC is still removed
+  there) and the file's creation (birth) time.
+- In the TUI the same switches are in the settings (`s`, group "Keep (not wiped)"), saved as `"keep": [...]` in the config file;
+  the top bar shows `keeps: ...` whenever anything is kept, and the Results log shows `(kept: ...)` per file.
 
 ## Full scrub (`--full`)
 

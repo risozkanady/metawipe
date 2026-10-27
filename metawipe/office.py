@@ -7,6 +7,8 @@ the owner parts with a tag-level rewrite), nested Office packages are cleaned re
 container itself is normalised (fixed timestamps, no extra fields). With --full, comment/revision
 authors and dates are anonymised, pictures inside the package are cleaned, customXml stores and the
 sensitivity label are dropped as well and media that cannot be cleaned are reported as left over.
+With --keep, a fresh core.xml/app.xml/meta.xml holding only the kept, validated fields is written (never the
+original part) and a kept thumbnail is cleaned like any picture; nested packages always use the strict default.
 
 Part names are compared the OPC way (percent-decoded, case-insensitive, backslashes as slashes).
 XML parts are edited as text (decoded by BOM/declaration and re-encoded the same way) so namespace
@@ -22,12 +24,14 @@ import re
 import shutil
 import zipfile
 import xml.etree.ElementTree as ET
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import unquote
+from xml.sax.saxutils import escape
 from xml.parsers import expat
 
 from . import images
-from .common import Context, WipeError
+from .common import Context, WipeError, real_date, text_ok
 
 OOXML_EXT = {
     ".docx", ".docm", ".dotx", ".dotm", ".xlsx", ".xlsm", ".xltx", ".xltm",
@@ -51,6 +55,16 @@ _ODF_EMPTY_META = (
     '<office:document-meta xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
     'office:version="1.3"><office:meta/></office:document-meta>'
 ).encode()
+_CP_NS = "http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
+_DC_NS = "http://purl.org/dc/elements/1.1/"
+_DCT_NS = "http://purl.org/dc/terms/"
+_EXT_NS = "http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"
+_OFFICE_NS = "urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+_META_NS = "urn:oasis:names:tc:opendocument:xmlns:meta:1.0"
+_ISO = re.compile(r"(\d{4})-(\d\d)-(\d\d)(?:T(\d\d):(\d\d)(?::(\d\d)(?:\.\d{1,9})?)?(?:Z|[+-](\d\d):(\d\d))?)?", re.A)
+_APPVER = re.compile(r"\d{1,2}\.\d{1,4}")
+_MAX_PROPS = 1 << 20  # larger property parts are not read; the kept fields are dropped
+_MAX_THUMB = 4 << 20
 _EPOCH = (1980, 1, 1, 0, 0, 0)
 _MAX_DEPTH = 3
 _FIXED_DATE = "2000-01-01T00:00:00Z"
@@ -166,6 +180,163 @@ _ODF_ANON_RULES = _Rules(texts=[
      "-", ""),
     ("text", "creator", "creator", ""),
 ])
+_DATE_ATTRS = {"date", "dateUtc", "dT", "dt", "created", "dateTime"}
+
+
+def _anon_rules(rs: "_Rules", keep) -> "_Rules":
+    """The --full anonymisation rules minus what --keep people/dates leaves alone."""
+    return _Rules(attrs=[a for a in rs.attrs if ("dates" if a[2] in _DATE_ATTRS else "people") not in keep],
+                  texts=[] if "people" in keep else rs.texts, drops=rs.drops)
+
+
+def _odf_anon_rules(keep) -> "_Rules":
+    return _Rules(texts=[t for t in _ODF_ANON_RULES.texts if ("dates" if t[1] in ("date", "date-string") else "people") not in keep])
+
+
+# --- kept properties: whitelisted, validated fields written into a fresh part --------------------
+
+def _iso(s: str):
+    m = _ISO.fullmatch(s)
+    if m is None:
+        return None
+    th, tm = (int(g) if g else 0 for g in m.group(7, 8))
+    return s if real_date(*m.group(1, 2, 3, 4, 5, 6)) and th <= 14 and tm < 60 else None
+
+
+def _text(cap: int):
+    def check(s: str):
+        s = s.strip()
+        return s if text_ok(s, cap) else None
+    return check
+
+
+def _appver(s: str):
+    return s.strip() if _APPVER.fullmatch(s.strip()) else None
+
+
+# (namespace, local name, prefix, category, value check)
+_CORE_PROPS = [
+    (_DCT_NS, "created", "dcterms", "dates", _iso), (_DCT_NS, "modified", "dcterms", "dates", _iso),
+    (_CP_NS, "lastPrinted", "cp", "dates", _iso),
+    (_DC_NS, "creator", "dc", "people", _text(256)), (_CP_NS, "lastModifiedBy", "cp", "people", _text(256)),
+    (_DC_NS, "title", "dc", "descriptions", _text(2000)), (_DC_NS, "subject", "dc", "descriptions", _text(2000)),
+    (_CP_NS, "keywords", "cp", "descriptions", _text(2000)), (_DC_NS, "description", "dc", "descriptions", _text(2000)),
+    (_CP_NS, "category", "cp", "descriptions", _text(2000)),
+]
+_APP_PROPS = [
+    (_EXT_NS, "Application", "", "software", _text(256)), (_EXT_NS, "AppVersion", "", "software", _appver),
+    (_EXT_NS, "Company", "", "people", _text(256)), (_EXT_NS, "Manager", "", "people", _text(256)),
+]
+_ODF_PROPS = [
+    (_META_NS, "creation-date", "meta", "dates", _iso), (_DC_NS, "date", "dc", "dates", _iso),
+    (_META_NS, "print-date", "meta", "dates", _iso),
+    (_META_NS, "generator", "meta", "software", _text(256)),
+    (_META_NS, "initial-creator", "meta", "people", _text(256)), (_DC_NS, "creator", "dc", "people", _text(256)),
+    (_DC_NS, "title", "dc", "descriptions", _text(2000)), (_DC_NS, "subject", "dc", "descriptions", _text(2000)),
+    (_META_NS, "keyword", "meta", "descriptions", _text(2000)), (_DC_NS, "description", "dc", "descriptions", _text(2000)),
+]
+
+
+def _pick(zin: zipfile.ZipFile, name: str, path: list, table: list, ctx: Context) -> list:
+    """[(prefix, local, value, category)]: the whitelisted, valid children of the element at `path` (fail closed)."""
+    try:
+        if zin.getinfo(name).file_size > _MAX_PROPS:
+            raise ValueError("too large")
+        data = zin.read(name)
+        if b"<!ENTITY" in data:
+            raise ValueError("declares entities")
+        node = ET.fromstring(data)
+        if node.tag != path[0]:
+            raise ValueError("unexpected root element")
+        for tag in path[1:]:
+            node = node.find(tag)
+            if node is None:
+                return []
+    except (ET.ParseError, ValueError) as e:
+        ctx.warn(f"{name} could not be read ({e}); its fields were not kept")
+        return []
+    out, seen = [], set()
+    for el in list(node)[:256]:
+        for ns, local, prefix, cat, check in table:
+            if cat in ctx.keep and el.tag == f"{{{ns}}}{local}" and not len(el) and (local == "keyword" or local not in seen):
+                value = check(el.text or "")
+                if value is not None and len(out) < 64:
+                    seen.add(local)
+                    out.append((prefix, local, value, cat))
+    return out
+
+
+def _fields(items: list) -> str:
+    xsi = ' xsi:type="dcterms:W3CDTF"'
+    return "".join(
+        f"<{q}{xsi if p == 'dcterms' else ''}>{escape(v)}</{q}>" for p, l, v, _ in items for q in [f"{p}:{l}" if p else l])
+
+
+def _ooxml_kept(zin: zipfile.ZipFile, by_norm: dict, ctx: Context) -> dict:
+    """Part name -> bytes for the property parts and thumbnail that --keep carries over. Rebuilt parts keep their
+    name, so the root relationship and the content-type override stay as they were."""
+    root_name = by_norm.get("_rels/.rels")
+    if root_name is None or not ctx.keep & {"dates", "people", "descriptions", "software", "thumbnails"}:
+        return {}
+    out = {}
+    for rel in ET.fromstring(zin.read(root_name)):
+        kind, nn = rel.get("Type", ""), _resolve("", rel.get("Target", ""))
+        if rel.get("TargetMode") == "External" or nn in out or nn not in by_norm:
+            continue
+        name = by_norm[nn]
+        if kind.endswith("/metadata/thumbnail"):
+            if "thumbnails" in ctx.keep:
+                data = _thumbnail(zin, name, ctx)
+                if data is not None:
+                    out[nn] = data
+                    ctx.kept.add("thumbnails")
+            continue
+        core = kind.endswith("/metadata/core-properties")
+        if not core and not kind.endswith("/extended-properties"):
+            continue
+        items = _pick(zin, name, [f"{{{_CP_NS}}}coreProperties" if core else f"{{{_EXT_NS}}}Properties"],
+                      _CORE_PROPS if core else _APP_PROPS, ctx)
+        if items:
+            head = ('<cp:coreProperties xmlns:cp="%s" xmlns:dc="%s" xmlns:dcterms="%s" '
+                    'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">' % (_CP_NS, _DC_NS, _DCT_NS)) if core else f'<Properties xmlns="{_EXT_NS}">'
+            out[nn] = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' + head + _fields(items)
+                       + ("</cp:coreProperties>" if core else "</Properties>")).encode()
+            ctx.kept.update(i[3] for i in items)
+    return out
+
+
+def _odf_kept(zin: zipfile.ZipFile, by_norm: dict, ctx: Context) -> dict:
+    out = {}
+    if "meta.xml" in by_norm and ctx.keep & {"dates", "people", "descriptions", "software"}:
+        name = by_norm["meta.xml"]
+        items = _pick(zin, name, [f"{{{_OFFICE_NS}}}document-meta", f"{{{_OFFICE_NS}}}meta"], _ODF_PROPS, ctx)
+        if items:
+            out["meta.xml"] = (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                f'<office:document-meta xmlns:office="{_OFFICE_NS}" xmlns:dc="{_DC_NS}" xmlns:meta="{_META_NS}" '
+                f'office:version="1.3"><office:meta>{_fields(items)}</office:meta></office:document-meta>').encode()
+            ctx.kept.update(i[3] for i in items)
+    if "thumbnails" in ctx.keep and "thumbnails/thumbnail.png" in by_norm:
+        data = _thumbnail(zin, by_norm["thumbnails/thumbnail.png"], ctx)
+        if data is not None:
+            out["thumbnails/thumbnail.png"] = data
+            ctx.kept.add("thumbnails")
+    return out
+
+
+def _thumbnail(zin: zipfile.ZipFile, name: str, ctx: Context):
+    """The thumbnail cleaned like any embedded picture, or None (reported) when that is not possible."""
+    fn = images.BY_EXT.get(posixpath.splitext(name)[1].lower())
+    if fn is None or fn is images.clean_tiff or zin.getinfo(name).file_size > _MAX_THUMB:
+        ctx.cannot_keep("thumbnails", f"{name} is not a picture format that can be cleaned here")
+        return None
+    try:
+        return fn(zin.read(name))
+    except WipeError as e:
+        ctx.cannot_keep("thumbnails", f"{name} could not be cleaned ({e})")
+        return None
+
+
 _ODF_PRINTER_ITEM = re.compile(
     r"(<(?P<p>(?:[\w.-]+:)?)config-item(?![\w.-])(?P<a>" + _TAG_BODY + r")>)[^<]*(</(?P=p)config-item\s*>)")
 _ODF_PRINTER_NAME = re.compile(r"""\bname\s*=\s*["'](?:PrinterName|PrinterSetup)["']""")
@@ -254,8 +425,8 @@ def _ooxml_dropped(nns: list[str], by_norm: dict, zin: zipfile.ZipFile, full: bo
     return dropped
 
 
-def _odf_is_dropped(nn: str, full: bool) -> bool:
-    return (
+def _odf_is_dropped(nn: str, full: bool, kept=()) -> bool:
+    return nn not in kept and (
         nn.startswith("thumbnails/")
         or nn in ("meta-inf/documentsignatures.xml", "meta-inf/macrosignatures.xml")
         or (full and nn.startswith("configurations2/"))
@@ -444,9 +615,9 @@ def _rewrite_xml(name: str, data: bytes, ctx: Context, fn) -> bytes:
     return out
 
 
-def _ooxml_rules(nn: str, full: bool) -> _Rules:
+def _ooxml_rules(nn: str, full: bool, keep=frozenset()) -> _Rules:
     rules = _Rules()
-    for name_re, rs in _PEOPLE_RULES + (_OOXML_ANON if full else []):
+    for name_re, rs in _PEOPLE_RULES + [(r, _anon_rules(x, keep)) for r, x in _OOXML_ANON if full]:
         if name_re.match(nn):
             rules.extend(rs)
     return rules
@@ -498,14 +669,14 @@ def _clean_content_types(data: bytes, dropped: set[str]) -> bytes:
     return ET.tostring(root, encoding="UTF-8", xml_declaration=True)
 
 
-def _clean_manifest(data: bytes, full: bool) -> bytes:
+def _clean_manifest(data: bytes, full: bool, kept=()) -> bytes:
     ET.register_namespace("manifest", _MANIFEST_NS)
     root = ET.fromstring(data)
     entry = f"{{{_MANIFEST_NS}}}file-entry"
     path_attr = f"{{{_MANIFEST_NS}}}full-path"
     changed = False
     for el in list(root):
-        if el.tag == entry and _odf_is_dropped(_norm(el.get(path_attr, "")), full):
+        if el.tag == entry and _odf_is_dropped(_norm(el.get(path_attr, "")), full, kept):
             root.remove(el)
             changed = True
     if not changed:
@@ -538,9 +709,13 @@ def clean_package(zin: zipfile.ZipFile, zout: zipfile.ZipFile, ctx: Context, dep
     rel_ids: dict = {}  # owner part -> relationship ids that point at dropped parts
     if is_odf:
         _check_odf_not_encrypted(zin, by_norm)
-        dropped = {nn for nn in nns if _odf_is_dropped(nn, ctx.full)}
+        replaced = _odf_kept(zin, by_norm, ctx)
+        keep_thumb = ("thumbnails/", "thumbnails/thumbnail.png") if "thumbnails/thumbnail.png" in replaced else ()
+        dropped = {nn for nn in nns if _odf_is_dropped(nn, ctx.full, keep_thumb)}
+        odf_anon = _odf_anon_rules(ctx.keep)
     else:
-        dropped = _ooxml_dropped(nns, by_norm, zin, ctx.full)
+        replaced = _ooxml_kept(zin, by_norm, ctx)
+        dropped = _ooxml_dropped(nns, by_norm, zin, ctx.full) - replaced.keys()
         for item, nn in entries:
             owner = _rels_owner(nn)
             if owner is not None and owner not in dropped:
@@ -571,6 +746,8 @@ def clean_package(zin: zipfile.ZipFile, zout: zipfile.ZipFile, ctx: Context, dep
         ext = posixpath.splitext(nn)[1]
         if item.is_dir():
             zout.writestr(zi, b"")
+        elif nn in replaced:
+            zout.writestr(zi, replaced[nn])
         elif is_odf and nn == "mimetype":
             zi.compress_type = zipfile.ZIP_STORED
             zout.writestr(zi, zin.read(name))
@@ -579,15 +756,15 @@ def clean_package(zin: zipfile.ZipFile, zout: zipfile.ZipFile, ctx: Context, dep
         elif is_odf and base == "settings.xml":
             zout.writestr(zi, _rewrite_xml(name, zin.read(name), ctx, _odf_settings))
         elif is_odf and nn == "meta-inf/manifest.xml":
-            zout.writestr(zi, _clean_manifest(zin.read(name), ctx.full))
-        elif is_odf and ctx.full and base in ("content.xml", "styles.xml"):
-            zout.writestr(zi, _rewrite_xml(name, zin.read(name), ctx, lambda t: _apply_rules(t, _ODF_ANON_RULES, set())))
+            zout.writestr(zi, _clean_manifest(zin.read(name), ctx.full, keep_thumb))
+        elif is_odf and ctx.full and odf_anon and base in ("content.xml", "styles.xml"):
+            zout.writestr(zi, _rewrite_xml(name, zin.read(name), ctx, lambda t: _apply_rules(t, odf_anon, set())))
         elif not is_odf and nn == "[content_types].xml":
             zout.writestr(zi, _clean_content_types(zin.read(name), dropped))
         elif not is_odf and nn.endswith(".rels"):
             zout.writestr(zi, _clean_rels(name, nn, zin.read(name), dropped, ctx))
-        elif not is_odf and nn.endswith(".xml") and (_ooxml_rules(nn, ctx.full) or nn in rel_ids):
-            rules, ids = _ooxml_rules(nn, ctx.full), rel_ids.get(nn, set())
+        elif not is_odf and nn.endswith(".xml") and (_ooxml_rules(nn, ctx.full, ctx.keep) or nn in rel_ids):
+            rules, ids = _ooxml_rules(nn, ctx.full, ctx.keep), rel_ids.get(nn, set())
             zout.writestr(zi, _rewrite_xml(name, zin.read(name), ctx, lambda t: _apply_rules(t, rules, ids)))
         elif ext in OOXML_EXT | ODF_EXT:
             if depth >= _MAX_DEPTH:
@@ -626,7 +803,7 @@ def _clean_nested(data: bytes, name: str, ctx: Context, depth: int) -> bytes:
     try:
         buf = io.BytesIO()
         with zipfile.ZipFile(io.BytesIO(data)) as zin, zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
-            clean_package(zin, zout, ctx, depth)
+            clean_package(zin, zout, replace(ctx, keep=frozenset()), depth)  # embedded documents: strict default
         return buf.getvalue()
     except (WipeError, zipfile.BadZipFile, ET.ParseError, KeyError, RuntimeError, NotImplementedError) as e:
         ctx.leftover(f"embedded package {name} left untouched ({e})")
