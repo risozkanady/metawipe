@@ -75,13 +75,25 @@ class ThemeConfigTests(unittest.TestCase):
 @unittest.skipIf(MetawipeApp is None, "textual missing")
 class TreeReloadTests(unittest.TestCase):
     def test_tree_shows_new_files_after_run_and_on_f5(self):
+        self.reload_scenario(via_symlink=False)
+
+    @unittest.skipIf(os.name == "nt", "symlinks need extra rights on Windows")
+    def test_started_through_a_symlink(self):
+        """macOS: /tmp and /var are symlinks; the tree resolves folders, so the start folder must be resolved too."""
+        self.reload_scenario(via_symlink=True)
+
+    def reload_scenario(self, via_symlink):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(Path(tmp) / "cfg")}):
             src = Path(tmp) / "in"
             (src / "sub").mkdir(parents=True)
             (src / "a.png").write_bytes(png_bytes([(b"tEXt", b"Author\x00" + SECRET)]))
+            start = src
+            if via_symlink:
+                start = Path(tmp) / "link"
+                start.symlink_to(src)
 
             async def scenario():
-                app = MetawipeApp(src)
+                app = MetawipeApp(start)
                 async with app.run_test(size=(140, 40)) as pilot:
                     await wait_for_tree(app, pilot)
                     await pilot.press("down", "down")  # sub, a.png
@@ -93,6 +105,7 @@ class TreeReloadTests(unittest.TestCase):
                             break
                     self.assertIn("a.clean.png", tree_names(app))
                     self.assertEqual(app._current_path().name, "a.png")  # cursor stays where it was
+                    self.assertEqual(app.states.get(app._current_path()), "done")  # ✓ in the tree
                     (src / "made-outside").mkdir()
                     await pilot.press("f5")
                     await pilot.pause(0.5)

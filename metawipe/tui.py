@@ -233,7 +233,8 @@ class MetawipeApp(App):
 
     def __init__(self, start: Path | None = None):
         super().__init__()
-        self.start = Path(start or Path.cwd())
+        # resolved like the tree resolves the folders it opens (macOS: /tmp -> /private/tmp), so paths stay comparable
+        self.start = Path(start or Path.cwd()).expanduser().resolve()
         self.marks: set[Path] = set()
         self.highlighted: Path | None = None
         self.view_all = False  # preview: what the file reveals (summary) or every metadata entry it carries

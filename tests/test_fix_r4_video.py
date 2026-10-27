@@ -251,7 +251,7 @@ class DestinationErrors(Base):
         self.assertEqual(err, f"error  x.png: IsADirectoryError: [Errno 21] Is a directory: '{Path('o') / 'x.png'}'\n")
         self.assertEqual([f.name for f in self.dir.iterdir() if f.name.startswith(".metawipe-")], [])
 
-    @unittest.skipIf(os.geteuid() == 0, "root ignores permissions")
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "root (and Windows) ignore these permission bits")
     def test_unwritable_directory(self):
         ro = self.dir / "ro"
         ro.mkdir()

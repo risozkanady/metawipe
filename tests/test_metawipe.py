@@ -8,6 +8,7 @@ import shutil
 import stat
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -661,7 +662,7 @@ class CliTests(Base):
         self.assertIn("not found", err)
         self.assertIn("done:", out)
 
-    @unittest.skipIf(os.name == "nt", "Windows names are UTF-16")
+    @unittest.skipIf(os.name == "nt" or sys.platform == "darwin", "Windows and macOS names must be valid Unicode")
     def test_non_utf8_filename(self):
         name = os.fsdecode(b"caf\xe9.png")
         p = self.dir / name
