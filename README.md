@@ -13,6 +13,19 @@ Command-line tool that strips identifying metadata from files before you share t
 
 ## Install
 
+Ready-made executables (Python and the TUI included, nothing else to install):
+
+- **macOS / Linux with Homebrew:** `brew install risozkanady/metawipe/metawipe`
+- **Windows:** `metawipe-VERSION-windows-x86_64.zip` from [Releases](https://github.com/risozkanady/metawipe/releases);
+  unzip and run `metawipe.exe` (double-click opens the TUI). The file is not signed, so SmartScreen asks once
+  ("More info" → "Run anyway").
+- **Linux:** `metawipe-VERSION-linux-x86_64.tar.gz` from [Releases](https://github.com/risozkanady/metawipe/releases);
+  unpack and put `metawipe` on the PATH.
+
+Building one yourself: `pip install '.[tui]' pyinstaller && packaging/build.sh` (result in `dist/`).
+
+From source:
+
 ```
 git clone https://github.com/wspnowpartnerGAUC/metawipe && cd metawipe
 python3 -m venv .venv && source .venv/bin/activate
