@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "metawipe"
-version = "0.3.1b2"
+version = "0.3.1b3"
 description = "CLI that strips metadata from images, HEIC, videos, PDFs and Office/OpenDocument files"
 readme = "README.md"
 license = { file = "LICENSE" }
