@@ -19,7 +19,7 @@ from textual.widgets._header import HeaderClock, HeaderClockSpace
 from textual.widgets.option_list import Option
 
 from . import __version__, cli, peek
-from .common import WipeError
+from .common import KEEP, WipeError
 
 MODES = [("Copy next to the original (NAME.clean.EXT)", "copy"), ("Copy into a folder", "folder"), ("Overwrite the originals", "inplace")]
 
@@ -37,6 +37,9 @@ SETTINGS = {
     "preview_everything": ("Preview starts with", [(False, "what a file reveals"), (True, "everything it carries")]),
     "remember_options": ("Remember cleaning options", [(False, "no"), (True, "yes: output, folder, full scrub, replace")]),
 }
+# the "Keep (not wiped)" group of the settings window: one wipe/keep switch per common.KEEP category
+KEEP_LABELS = {"dates": "Dates and times", "location": "Location (GPS)", "device": "Device (make, model, serial)", "software": "Software",
+               "people": "People (author, owner)", "descriptions": "Titles and comments", "thumbnails": "Thumbnails"}
 CLOCK_FORMATS = {"time": "%H:%M:%S", "date": "%d.%m.%Y  %H:%M"}
 
 
@@ -53,6 +56,12 @@ def load_config() -> dict:
     except (OSError, ValueError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def load_keep(config: dict) -> list[str]:
+    """The saved "keep" list, only known category names (a hand-edited or damaged file must not crash or widen anything)."""
+    saved = config.get("keep")
+    return [k for k in KEEP if isinstance(saved, list) and k in saved]
 
 
 def save_config(**changes) -> None:
@@ -161,7 +170,7 @@ class SettingsScreen(ModalScreen[None]):
     BINDINGS = [Binding("escape,q,s", "close", "Close"), Binding("space", "change", "Change")]
     DEFAULT_CSS = """
     SettingsScreen { align: center middle; }
-    SettingsScreen > Vertical { width: 80; max-width: 96%; height: auto; border: thick $primary; background: $surface; padding: 1 2; }
+    SettingsScreen > Vertical { width: 80; max-width: 96%; height: auto; max-height: 100%; overflow-y: auto; border: thick $primary; background: $surface; padding: 1 2; }
     SettingsScreen OptionList { height: auto; border: none; margin-bottom: 1; }
     """
 
@@ -178,8 +187,10 @@ class SettingsScreen(ModalScreen[None]):
 
     def _rows(self) -> list[Option]:
         rows = [Option(Text(f"{'Theme':<28}{self.app.theme}   (Enter: pick)"), id="theme")]
-        return rows + [Option(Text(f"{label:<28}{dict(choices)[self.app.settings[key]]}"), id=key)
-                       for key, (label, choices) in SETTINGS.items()]
+        rows += [Option(Text(f"{label:<28}{dict(choices)[self.app.settings[key]]}"), id=key) for key, (label, choices) in SETTINGS.items()]
+        rows.append(Option(Text("Keep (not wiped): these stay in the cleaned files", style=f"bold {STEEL}"), id="keep-head", disabled=True))
+        return rows + [Option(Text.assemble(f"  {KEEP_LABELS[k]:<26}", ("keep", f"bold {AMBER}") if k in self.app.keep else "wipe"), id=f"keep:{k}")
+                       for k in KEEP]
 
     def _refresh(self) -> None:
         options = self.query_one(OptionList)
@@ -191,6 +202,10 @@ class SettingsScreen(ModalScreen[None]):
         key = event.option.id
         if key == "theme":
             self.app.action_change_theme()  # Textual's own picker, previews as you move
+            return
+        if key.startswith("keep:"):
+            self.app.toggle_keep(key[5:])
+            self._refresh()
             return
         values = [value for value, _ in SETTINGS[key][1]]
         self.app.set_setting(key, values[(values.index(self.app.settings[key]) + 1) % len(values)])
@@ -218,7 +233,8 @@ HELP = """[b]metawipe[/b] - removes identifying metadata (location, device, auth
   r  clean everything marked (marks clear)        f  toggle full scrub
   v  preview: switch between "what it reveals" and [b]everything[/b] the file carries (scrolls; sections in blue)
   F5  reload the file tree (also happens after every run)
-  s  settings: theme, clock/date, hidden files, preview mode, remember the options (saved in ~/.config/metawipe/config.json)
+  s  settings: theme, clock/date, hidden files, preview mode, remember the options, [b]Keep (not wiped)[/b] switches
+     (saved in ~/.config/metawipe/config.json)
   F1 or ?  this help                              q  quit            Tab  jump between tree and options
 
 [b]Options[/b]
@@ -229,9 +245,19 @@ HELP = """[b]metawipe[/b] - removes identifying metadata (location, device, auth
       overwrite the originals (asks first - cannot be undone).
   [b]Overwrite existing (-f)[/b]  replace output files that already exist (otherwise they are left alone and reported).
 
+[b]Keep (not wiped)[/b]  (settings, key s)  one switch per kind of metadata: dates, location, device, software, people,
+      descriptions, thumbnails. Default is "wipe" for all. A kept kind stays in the cleaned file; everything else is still removed.
+      Values are copied one by one and checked (a date must be a date, text is length-limited), never a whole Exif/XMP block.
+      The top bar shows [b]keeps: ...[/b] while anything is kept. "dates" also keeps the file's modification time.
+      With full scrub on, a kept kind is also spared by its step: comment authors (people), comment dates (dates), x264/x265 (software),
+      PDF thumbnails (thumbnails).
+      Never kept: the camera's MakerNote, XMP and IPTC (in this version), the file's creation (birth) time.
+      A format that cannot carry a kept kind says so with a warning and removes it.
+
 [b]Results[/b]
   clean  file -> destination        error  why it failed        skip  not a file metawipe handles
   "still carries: ..."  what the cleaned copy still has (so you can see what a normal run leaves behind)
+  "(kept: dates, ...)"  what really stayed in that file
   warn   something worth knowing (e.g. signatures removed, OLE embeddings left)
 
 [b]Supported[/b]  jpg png apng webp tiff | heic heif avif | mov mp4 m4v 3gp (needs ffmpeg) | pdf | docx xlsx pptx and
@@ -315,6 +341,8 @@ class MetawipeApp(App):
         self.settings = {key: self.config[key] if self.config.get(key) in [v for v, _ in choices] else choices[0][0]
                          for key, (_, choices) in SETTINGS.items()}
         self.view_all = self.settings["preview_everything"]  # preview: what the file reveals or every metadata entry
+        self.keep: set[str] = set(load_keep(self.config))  # categories left in the cleaned files
+        self._base_sub = self.SUB_TITLE
         self.states: dict[Path, str] = {}  # outcome of the last run per file: done / incomplete / failed
 
     def compose(self) -> ComposeResult:
@@ -358,6 +386,7 @@ class MetawipeApp(App):
         if self.settings["remember_options"]:
             self._restore_options(self.config.get("options"))
         self._sync_run_button()
+        self._sync_subtitle()
         self.log_line("Mark files with [b]space[/] or [b]m[/] and press [b]r[/]. Folders are cleaned recursively. [b]F1[/] explains everything here.")
 
     # ------------------------------------------------------------------ helpers
@@ -404,6 +433,16 @@ class MetawipeApp(App):
         self._save(**{key: value})
         self._apply_setting(key)
 
+    def toggle_keep(self, name: str) -> None:
+        self.keep.symmetric_difference_update({name})
+        self._save(keep=[k for k in KEEP if k in self.keep])
+        self._sync_subtitle()
+
+    def _sync_subtitle(self) -> None:
+        """Always visible in the top bar: whatever is kept is NOT wiped, nobody should forget that."""
+        kept = ", ".join(k for k in KEEP if k in self.keep)
+        self.sub_title = self._base_sub + (f"   |   keeps: {kept}" if kept else "")
+
     def _apply_setting(self, key: str) -> None:
         value = self.settings[key]
         if key == "clock":
@@ -441,7 +480,8 @@ class MetawipeApp(App):
     # ------------------------------------------------------------------ marking
     def _marks_changed(self) -> None:
         self._refresh_tree()
-        self.sub_title = f"{len(self.marks)} marked"
+        self._base_sub = f"{len(self.marks)} marked"
+        self._sync_subtitle()
         self._sync_run_button()
 
     def _sync_run_button(self) -> None:
@@ -570,7 +610,7 @@ class MetawipeApp(App):
             paths=[str(p) for p in sorted(self.marks)], recursive=True, in_place=mode == "inplace",
             output_dir=Path(os.path.expanduser(outdir)) if mode == "folder" else None,
             force=self.query_one("#force", Switch).value, password=None,
-            full=self.query_one("#full", Switch).value, verbose=True,
+            full=self.query_one("#full", Switch).value, verbose=True, keep=frozenset(self.keep),
         )
 
     def action_run(self) -> None:
@@ -619,7 +659,7 @@ class MetawipeApp(App):
                 self.call_from_thread(self.states.__setitem__, job.src, "incomplete")
                 note = f" (INCOMPLETE: {len(ctx.residue)} item(s) left)"
             emit(Text.assemble(("clean", "green"), f"  {self._short(job.src)} -> {'in place' if job.inplace else self._short(job.dst)}",
-                               (note, "yellow")))
+                               (note, "yellow"), (cli.kept_note(ctx), AMBER)))
             if left:
                 emit(Text("        still carries: " + ", ".join(k for k, _ in left[:6]) + (" ..." if len(left) > 6 else "")))
         emit(f"[b]done:[/] {report.cleaned} cleaned, {report.failed} failed, {report.skipped} skipped" + (f", {incomplete} incomplete" if args.full else ""))

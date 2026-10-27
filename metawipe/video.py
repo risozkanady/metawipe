@@ -6,10 +6,11 @@ import re
 import shutil
 import struct
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 from . import sei
-from .common import Context, WipeError
+from .common import KEEP, Context, WipeError, text_ok
 
 VIDEO_EXT = {".mov", ".mp4", ".m4v", ".3gp"}
 _OUTPUT_FORMAT = {".mov": "mov", ".mp4": "mp4", ".m4v": "mp4", ".3gp": "3gp"}
@@ -20,15 +21,75 @@ def _file_url(path: Path) -> str:
     return "file:" + str(path.resolve())
 
 
-def _probe(src: Path) -> dict | None:
-    """ffprobe's view of the streams; None when ffprobe is not installed."""
+# Exact tag keys per --keep category (never `com.apple.quicktime.*`: that namespace mixes categories).
+# "encoder" of the container (udta ©too) cannot be written back under +bitexact; the one of a stream can.
+_KEEP_TAGS = {
+    "location": ("location", "com.apple.quicktime.location.ISO6709"),
+    "device": ("make", "model", "com.apple.quicktime.make", "com.apple.quicktime.model"),
+    "software": ("software", "com.apple.quicktime.software"),
+    "people": tuple(k for n in ("artist", "author", "copyright") for k in (n, "com.apple.quicktime." + n)),
+    "descriptions": tuple(k for n in ("title", "comment", "description", "keywords") for k in (n, "com.apple.quicktime." + n)),
+}
+_ISO6709 = re.compile(r"[+-]\d{2}(\.\d{1,10})?[+-]\d{3}(\.\d{1,10})?([+-]\d{1,6}(\.\d{1,6})?)?(CRS\w{1,20})?/", re.A)
+_DATE = re.compile(r"(\d{4})-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d{1,6})?Z", re.A)
+
+
+def _date(v: str) -> str | None:
+    v = v.split(";")[0]  # files written with use_metadata_tags carry the mvhd time and an mdta copy, joined
+    m = _DATE.fullmatch(v)
+    try:
+        datetime.strptime(v[:19], "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+    return v if m and 1970 <= int(m[1]) <= 2039 else None  # ffmpeg wraps the time fields outside this range
+
+
+def _valid(category: str, v) -> str | None:
+    if not isinstance(v, str):
+        return None
+    if category == "dates":
+        return _date(v)
+    if category == "location":
+        return v if _ISO6709.fullmatch(v) else None
+    return v if text_ok(v, 2000 if category == "descriptions" else 256) else None
+
+
+def _wanted(info: dict, kept: list, ctx: Context, suffix: str) -> dict:
+    """{category: [(output stream index or None for the container, key, value)]} of what --keep asked for.
+    Whitelisted keys only, values validated; formats whose muxer drops text tags (3GP) get a warning instead."""
+    fmt = info.get("format", {}).get("tags", {})
+    out: dict = {}
+    for cat in KEEP:
+        if cat not in ctx.keep:
+            continue
+        pairs = [(None, k, _valid(cat, fmt.get(k))) for k in _KEEP_TAGS.get(cat, ())]
+        for i, s in enumerate(kept):
+            t = s.get("tags", {})
+            if cat == "dates":
+                pairs.append((i, "creation_time", _valid(cat, t.get("creation_time"))))
+            elif cat == "software":
+                pairs.append((i, "encoder", _valid(cat, t.get("encoder"))))
+        if cat == "dates":
+            pairs.append((None, "creation_time", _valid(cat, fmt.get("creation_time"))))
+        pairs = [p for p in pairs if p[2]]
+        if cat == "software" and fmt.get("encoder") and not pairs:
+            ctx.cannot_keep(cat, "the container's encoder string cannot be written by ffmpeg")
+        if pairs and suffix == ".3gp" and cat not in ("dates", "location"):
+            ctx.cannot_keep(cat, "3GP text tags are not written by ffmpeg")
+        elif pairs:
+            out[cat] = pairs
+    return out
+
+
+def _probe(src: Path, tags: bool = False) -> dict | None:
+    """ffprobe's view of the streams; None when ffprobe is not installed. tags: all container and stream tags."""
     ffprobe = shutil.which("ffprobe")
     if ffprobe is None:
         return None
     out = subprocess.run(
         [ffprobe, "-v", "error", "-protocol_whitelist", "file", "-f", "mov", "-print_format", "json",
-         "-show_entries", "stream=codec_type:stream_tags=language"
-         ":stream_disposition=attached_pic:stream_side_data=side_data_type", "-i", _file_url(src)],
+         "-show_entries", "stream=codec_type:" + ("format_tags:stream_tags" if tags else "stream_tags=language")
+         + ":stream_disposition=attached_pic:stream_side_data=side_data_type", "-i", _file_url(src)],
         capture_output=True, text=True, errors="replace",
     )
     try:
@@ -191,11 +252,13 @@ def video(src: Path, dst: Path, ctx: Context) -> None:
     if ffmpeg is None:
         raise WipeError("ffmpeg is required for video files (macOS: brew install ffmpeg)")
     suffix = src.suffix.lower()
-    info = _probe(src)
+    info = _probe(src, bool(ctx.keep))
     if info is None:
         if ctx.full:
             raise WipeError("ffprobe is required for --full on video (it comes with ffmpeg)")
         ctx.warn("ffprobe not found: track languages are not kept and Dolby Vision is not detected")
+        if ctx.keep:
+            ctx.warn("ffprobe not found: nothing was kept")
         info = {}
     streams = info.get("streams", [])
 
@@ -211,7 +274,18 @@ def video(src: Path, dst: Path, ctx: Context) -> None:
         if lang and lang != "und":
             languages += [f"-metadata:s:{out_index}", f"language={lang}"]
     if any(s.get("codec_type") == "video" and s.get("disposition", {}).get("attached_pic") for s in streams):
-        ctx.warn("cover art was dropped")
+        if "thumbnails" in ctx.keep:
+            ctx.cannot_keep("thumbnails", "cover art cannot be copied")
+        else:
+            ctx.warn("cover art was dropped")
+    wanted = _wanted(info, kept, ctx, suffix)
+    for cat, pairs in wanted.items():
+        for i, key, value in pairs:
+            languages += ["-metadata" if i is None else f"-metadata:s:{i}", f"{key}={value}"]
+    # plain keys and the com.apple.quicktime.* ones are only written (as mdta keys) with use_metadata_tags,
+    # which stores every tag that way and reads back under the key it was given
+    movflags = "+faststart" + ("+use_metadata_tags" if any(
+        i is None and k not in ("creation_time", "location") for p in wanted.values() for i, k, _ in p) else "")
 
     has_dovi = any(
         sd.get("side_data_type", "").startswith("DOVI") for s in streams for sd in s.get("side_data_list", [])
@@ -229,14 +303,22 @@ def video(src: Path, dst: Path, ctx: Context) -> None:
         "-map_metadata", "-1", "-map_chapters", "-1",
         "-c", "copy", *extra, *languages,
         "-fflags", "+bitexact", "-flags:v", "+bitexact", "-flags:a", "+bitexact",
-        "-movflags", "+faststart", "-f", _OUTPUT_FORMAT[suffix], _file_url(dst),
+        "-movflags", movflags, "-f", _OUTPUT_FORMAT[suffix], _file_url(dst),
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     problems = [line for line in proc.stderr.splitlines() if line.strip() and not _BENIGN.search(line)]
     if proc.returncode != 0 or problems:
         raise WipeError(f"ffmpeg failed: {problems[0] if problems else proc.returncode}")
     check_complete(src)  # after ffmpeg's own diagnostics, which are more specific where it notices the damage
-    if ctx.full:
+    if wanted:
+        back = _probe(dst, True) or {}  # only what ffprobe reads back from the output counts as kept
+        tags = [back.get("format", {}).get("tags", {})] + [x.get("tags", {}) for x in back.get("streams", [])]
+        for cat, pairs in wanted.items():
+            if any(k in tags[0 if i is None else i + 1] for i, k, _ in pairs if i is None or i + 1 < len(tags)):
+                ctx.kept.add(cat)
+            else:
+                ctx.cannot_keep(cat, "ffmpeg did not write it")
+    if ctx.full and "software" not in ctx.keep:  # kept software keeps the bitstream strings too
         # x264/x265 write their version and settings as user-data SEI messages into the bitstream
         # (and x265 also into hvcC); they are overwritten in place, all other SEI is kept.
         sei.scrub(dst, ctx)

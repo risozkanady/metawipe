@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from . import images
 from .common import Context, WipeError
 from .common import boxes as _boxes
 
@@ -167,7 +168,17 @@ def _clean_moov(buf: bytearray, start: int, end: int, handler: bytes = b"") -> N
             _clean_moov(buf, payload, box_end, _handler_type(buf, payload, box_end) if btype == b"mdia" else handler)
 
 
-def clean_heif(data: bytes) -> bytes:
+def _rebuilt_exif(item: bytes, keep: frozenset, warn) -> tuple[bytes | None, set]:
+    """Exif item payload (u32 tiff_header_offset + data) rebuilt from the kept categories; fits the old extent or None."""
+    if len(item) < 12 or (off := int.from_bytes(item[:4], "big")) > len(item) - 12:
+        warn("Exif data could not be read safely: none of it was kept")
+        return None, set()
+    block, cats = images.exif_keep(item[4 + off:], keep, warn, len(item) - 4)
+    return (bytes(4) + block, cats) if cats and block else (None, set())
+
+
+def clean_heif(data: bytes, keep: frozenset = frozenset(), kept: set | None = None, warn=None) -> bytes:
+    warn = warn or (lambda msg: None)
     buf = bytearray(data)
     end = len(buf)
     top = list(_boxes(buf, 0, end))
@@ -217,6 +228,7 @@ def clean_heif(data: bytes) -> bytes:
             extents = _iloc_extents(buf, lp, le, set(unwanted))
             idat = by_type.get(b"idat")
             for item_id, (type_pos, tail, be, _) in unwanted.items():
+                new, cats = None, set()
                 for method, offset, length in extents.get(item_id, []):
                     if method == 0:
                         start = offset
@@ -226,8 +238,15 @@ def clean_heif(data: bytes) -> bytes:
                         raise WipeError("unsupported iloc construction method for a metadata item")
                     if length == 0 or start + length > end:
                         raise WipeError("corrupt HEIF: metadata extent out of range")
+                    if keep and len(extents[item_id]) == 1 and bytes(buf[type_pos:type_pos + 4]) == b"Exif":
+                        new, cats = _rebuilt_exif(bytes(buf[start:start + length]), keep, warn)
                     _blank(buf, start, start + length)
-                buf[type_pos:type_pos + 4] = b"free"
+                    if new:
+                        buf[start:start + len(new)] = new
+                        if kept is not None:
+                            kept |= cats
+                if not new:  # a rebuilt Exif item keeps its type
+                    buf[type_pos:type_pos + 4] = b"free"
                 _blank(buf, tail, be)
         for btype, bs, pp, be in children:
             if btype in _BLANK_BOXES:
@@ -247,4 +266,4 @@ def clean_heif(data: bytes) -> bytes:
 
 
 def heif(src: Path, dst: Path, ctx: Context) -> None:
-    dst.write_bytes(clean_heif(src.read_bytes()))
+    dst.write_bytes(clean_heif(src.read_bytes(), ctx.keep, ctx.kept, ctx.warn))

@@ -13,10 +13,14 @@ import re
 from pathlib import Path
 
 from . import images
-from .common import Context, WipeError, quiet_pypdf
+from .common import Context, WipeError, quiet_pypdf, real_date, text_ok
 
 _INFO_KEYS = {"/Title", "/Author", "/Subject", "/Keywords", "/Creator", "/Producer", "/CreationDate", "/ModDate", "/Trapped"}
 _INFO_IDENTITY = _INFO_KEYS - {"/Title", "/Subject", "/Keywords", "/Trapped"}
+# --keep: the Info keys each category may bring back (only these, as plain validated strings)
+_KEEP_INFO = {"dates": ("/CreationDate", "/ModDate"), "people": ("/Author",), "software": ("/Creator", "/Producer"),
+              "descriptions": ("/Title", "/Subject", "/Keywords")}
+_PDF_DATE = re.compile(r"D:(\d{4})(\d\d)?(\d\d)?(\d\d)?(\d\d)?(\d\d)?(Z(?:00'(?:00'?)?)?|[+-]\d\d(?:'(?:\d\d'?)?)?)?", re.A)
 _PTEX = ("/PTEX.FileName", "/PTEX.PageNumber", "/PTEX.InfoDict")
 _PRIVATE = ("/PieceInfo", "/LastModified")  # application data and edit dates on the catalog, pages, forms, images
 _ANNOT_IDENTITY = ("/T", "/M", "/CreationDate", "/Subj", "/NM")  # author, dates, subject, unique name
@@ -140,6 +144,37 @@ def _drop_signature(obj) -> bool:
     return drawn
 
 
+def _date_ok(v) -> bool:
+    m = _PDF_DATE.fullmatch(v) if isinstance(v, str) else None
+    if not m:
+        return False
+    y, mo, d, h, mi, sec = (int(g) if g else dflt for g, dflt in zip(m.groups()[:6], (0, 1, 1, 0, 0, 0)))
+    z = m.group(7)
+    return real_date(y, mo, d, h, mi, sec) and (not z or z[0] == "Z" or int(z[1:3]) < 24 and int(z[4:6] or 0) < 60)
+
+
+def _kept_info(reader, ctx: Context) -> dict:
+    """The Info entries --keep asks for, validated; taken before _strip, which clears Info-shaped copies."""
+    from pypdf.generic import TextStringObject
+
+    want = [(c, k) for c in ctx.keep for k in _KEEP_INFO.get(c, ())]
+    if not want:
+        return {}
+    try:
+        info = _resolve(reader.trailer.get("/Info"))
+        out, cats = {}, set()
+        for c, k in want:
+            v = _resolve(info.get(k)) if hasattr(info, "get") else None
+            if isinstance(v, TextStringObject) and (_date_ok(v) if c == "dates" else text_ok(v, 2000 if c == "descriptions" else 256)):
+                out[k] = str(v)
+                cats.add(c)
+        ctx.kept |= cats
+        return out
+    except Exception:  # noqa: BLE001 - damaged Info: keep nothing
+        ctx.warn("PDF: the document info could not be read, nothing of it was kept")
+        return {}
+
+
 def _strip(root, reader, ctx: Context) -> tuple[set[str], set[str]]:
     """Remove identifying entries from everything reachable from root (in memory).
 
@@ -188,7 +223,18 @@ def _strip(root, reader, ctx: Context) -> tuple[set[str], set[str]]:
             page = kind == "/Page" or _untyped_page(obj)
             if page or kind == "/Catalog" or subtype in ("/Form", "/Image"):
                 _pop(obj, _PRIVATE)
-            _pop(obj, _PTEX + ("/Thumb", "/CreatorInfo"))
+            _pop(obj, _PTEX + ("/CreatorInfo",))
+            if "thumbnails" not in ctx.keep:
+                _pop(obj, ("/Thumb",))
+            elif "/Thumb" in obj:
+                th, sub, th_notes = _resolve(obj["/Thumb"]), Context(warn=lambda _m: None), set()
+                if not ctx.full and hasattr(th, "get") and th.get("/Subtype") == "/Image":
+                    _clean_image(th, sub, th_notes)  # its own Exif/IPTC were not asked for; --full reaches it by the walk
+                if sub.residue or th_notes:
+                    del obj["/Thumb"]
+                    ctx.cannot_keep("thumbnails", "the thumbnail picture could not be cleaned")
+                else:
+                    ctx.kept.add("thumbnails")
             if kind is None and _info_shaped(obj):
                 for k in list(obj.keys()):  # an Info-shaped dictionary (e.g. pdfTeX's /PTEX.InfoDict)
                     del obj[k]
@@ -322,13 +368,24 @@ def _inline_jpeg(obj, page: bool) -> bool:
     return False
 
 
+def _pop_identity(obj, keys, ctx: Context) -> None:
+    """Remove keys, except the dates (/M, /CreationDate) and author (/T) of annotations the user asked to keep."""
+    for k in keys:
+        c = "dates" if k in ("/M", "/CreationDate") else "people" if k == "/T" else None
+        if c in ctx.keep:
+            if k in obj:
+                ctx.kept.add(c)
+        else:
+            obj.pop(k, None)
+
+
 def _full_checks(obj, ctx: Context, notes: set[str], page: bool) -> None:
     """--full: annotation authors/dates, EXIF inside embedded JPEGs; flag what cannot be cleaned."""
     # Form fields and their widgets keep /T: it is the field name, which forms are addressed by.
     if obj.get("/Type") == "/Annot" or ("/Subtype" in obj and "/Rect" in obj):
-        _pop(obj, _FIELD_IDENTITY if _is_field(obj) else _ANNOT_IDENTITY)
+        _pop_identity(obj, _FIELD_IDENTITY if _is_field(obj) else _ANNOT_IDENTITY, ctx)
     elif "/FT" in obj or ("/Kids" in obj and "/T" in obj):
-        _pop(obj, _FIELD_IDENTITY)  # a field (or an intermediate field node) that is not a widget itself
+        _pop_identity(obj, _FIELD_IDENTITY, ctx)  # a field (or an intermediate field node) that is not a widget itself
     if "/XFA" in obj:
         notes.add("XFA form data")
     if obj.get("/Subtype") == "/Image":
@@ -357,14 +414,17 @@ def clean_pdf(src: Path, dst: Path, ctx: Context) -> None:
         root = _resolve(reader.trailer.get("/Root"))
         if not isinstance(root, DictionaryObject) or hasattr(root, "_data"):  # stripping the catalog is the point: do not write a file without it
             raise WipeError("cannot process PDF: the document catalog (/Root) is missing or not a dictionary")
+        kept = _kept_info(reader, ctx)
         warnings, notes = _strip(root, reader, ctx)
         reader.trailer.pop("/ID", None)  # the permanent file identifier links the output to the original
         writer = PdfWriter(clone_from=reader)
         writer.metadata = None
         writer._ID = None
+        if kept:
+            writer.add_metadata(kept)
         with open(dst, "wb") as fh:
             writer.write(fh)
-        _verify(dst)
+        _verify(dst, kept.keys())
         for msg in sorted(warnings):
             ctx.warn(f"PDF: {msg}")
         for note in sorted(notes):
@@ -381,12 +441,13 @@ def clean_pdf(src: Path, dst: Path, ctx: Context) -> None:
         raise WipeError(f"cannot process PDF: damaged structure ({type(e).__name__}: {e})") from e
 
 
-def _verify(path: Path) -> None:
+def _verify(path: Path, allowed=()) -> None:
     from pypdf import PdfReader
     from pypdf.generic import IndirectObject
 
     reader = PdfReader(path)
-    if reader.trailer.get("/Info") is not None or "/Metadata" in reader.trailer["/Root"]:
+    info = _resolve(reader.trailer.get("/Info"))
+    if (info is not None and not (hasattr(info, "keys") and info.keys() <= set(allowed))) or "/Metadata" in reader.trailer["/Root"]:
         raise WipeError("verification failed: document info/XMP still present")
     leftovers = 0
     for gen, ids in reader.xref.items():

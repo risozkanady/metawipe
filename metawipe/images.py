@@ -6,12 +6,13 @@ Only a whitelist of structural segments/chunks/tags is kept.
 """
 from __future__ import annotations
 
+import re
 import struct
 import zlib
 from bisect import bisect_left
 from pathlib import Path
 
-from .common import Context, WipeError, minimal_tiff, tiff_orientation
+from .common import KEEP, Context, WipeError, minimal_tiff, real_date, text_ok, tiff_orientation
 
 # ---------------------------------------------------------------- JPEG
 
@@ -71,12 +72,14 @@ def jpeg_segments(data):
         i = end
 
 
-def clean_jpeg(data: bytes) -> bytes:
+def clean_jpeg(data: bytes, keep: frozenset = frozenset(), kept: set | None = None, warn=None) -> bytes:
     """Rebuild a JPEG keeping only JFIF (without thumbnail), ICC, Adobe and image segments.
 
     Drops APP1 (Exif/XMP), APP13 (Photoshop/IPTC), MPF, COM and everything after the first EOI.
-    If the Exif block rotates the image, a block holding just the Orientation tag stays.
+    If the Exif block rotates the image, a block holding just the Orientation tag stays; the categories in `keep`
+    add fields of a freshly built Exif block (see exif_keep) and are reported in `kept`.
     """
+    kept = set() if kept is None else kept
     out = [b"\xff\xd8"]
     exif_done = False
     marker = None
@@ -88,10 +91,11 @@ def clean_jpeg(data: bytes) -> bytes:
         elif marker == 0xE1:
             if payload[:6] == _EXIF_PREFIX and not exif_done:
                 exif_done = True
-                orientation = tiff_orientation(payload[6:])
-                if orientation > 1:
-                    block = _EXIF_PREFIX + minimal_tiff(orientation)
+                tiff, cats = exif_keep(payload[6:], keep, warn, 0xFFFF - 2 - len(_EXIF_PREFIX))
+                if tiff:
+                    block = _EXIF_PREFIX + tiff
                     out.append(b"\xff\xe1" + struct.pack(">H", len(block) + 2) + block)
+                    kept |= cats
         elif marker == 0xE2:
             if payload[:12] == b"ICC_PROFILE\x00":
                 out.append(data[start:end])
@@ -124,29 +128,93 @@ def _png_chunk(ctype: bytes, payload: bytes) -> bytes:
     return struct.pack(">I", len(payload)) + ctype + payload + struct.pack(">I", zlib.crc32(ctype + payload))
 
 
-def _png_text_orientation(ctype: bytes, payload: bytes) -> int:
-    """Orientation stored by ImageMagick/ExifTool as a hex 'Raw profile type exif' text chunk."""
+def _png_text_exif(ctype: bytes, payload: bytes) -> bytes:
+    """The Exif block ImageMagick/ExifTool store as a hex 'Raw profile type exif' text chunk (b"" if none)."""
     try:
         keyword, _, rest = payload.partition(b"\x00")
         if not keyword.lower().startswith(b"raw profile type"):
-            return 1
+            return b""
         if ctype == b"zTXt":
             rest = zlib.decompressobj().decompress(rest[1:], 1 << 22)
         elif ctype != b"tEXt":
-            return 1
+            return b""
         tokens = rest.split()
         raw = bytes.fromhex(b"".join(tokens[2:]).decode("ascii"))
-        return tiff_orientation(raw[6:] if raw[:6] == _EXIF_PREFIX else raw)
+        return raw[6:] if raw[:6] == _EXIF_PREFIX else raw
     except (ValueError, zlib.error, UnicodeDecodeError):
-        return 1
+        return b""
 
 
-def clean_png(data: bytes) -> bytes:
-    """Keep only critical, colour and APNG chunks; drop tEXt/zTXt/iTXt/tIME/eXIf/C2PA/... and trailing data."""
+_PNG_TEXT = {"Creation Time": "dates", "date:create": "dates", "date:modify": "dates", "date:timestamp": "dates", "Software": "software", "Author": "people", "Copyright": "people",
+             "Title": "descriptions", "Description": "descriptions", "Comment": "descriptions"}
+_ISO_DATE = re.compile(r"(\d{4})-(\d\d)-(\d\d)(?:[T ](\d\d):(\d\d)(?::(\d\d)(?:\.\d{1,9})?)?(?:Z|[+-]\d\d:?\d\d)?)?", re.A)
+_RFC_DATE = re.compile(r"(?:(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), )?(\d{1,2}) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+                       r"(\d{4}) (\d\d):(\d\d)(?::(\d\d))? (?:[A-Z]{1,5}|[+-]\d{4})", re.A)
+_EXIF_DATE = re.compile(r"(\d{4}):(\d\d):(\d\d) (\d\d):(\d\d):(\d\d)", re.A)
+_MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
+
+
+def _date_text(text: str) -> bool:
+    """ISO 8601/W3CDTF, RFC 1123 or Exif date text that is a real date, and nothing else."""
+    if len(text) > 64:
+        return False
+    if m := _ISO_DATE.fullmatch(text) or _EXIF_DATE.fullmatch(text):
+        return real_date(*m.groups())
+    if m := _RFC_DATE.fullmatch(text):
+        d, mon, y, h, mi, s = m.groups()
+        return real_date(y, _MONTHS.index(mon) + 1, d, h, mi, s)
+    return False
+
+
+def _png_text(ctype: bytes, payload: bytes):
+    """(keyword, text) of a tEXt/zTXt/iTXt chunk; None when malformed (compressed text is capped at 4 KiB)."""
+    try:
+        keyword, _, rest = payload.partition(b"\x00")
+        if ctype == b"iTXt":
+            flag, method = rest[0], rest[1]
+            rest = rest[2:].partition(b"\x00")[2].partition(b"\x00")[2]  # language, translated keyword
+        elif ctype == b"zTXt":
+            flag, method, rest = 1, rest[0], rest[1:]
+        else:
+            flag = method = 0
+        if flag:
+            d = zlib.decompressobj()
+            rest = d.decompress(rest, 4096)
+            if method or not d.eof:
+                return None
+        return keyword.decode("ascii"), rest.decode("utf-8" if ctype == b"iTXt" else "latin-1")
+    except (IndexError, ValueError, zlib.error):
+        return None
+
+
+def _png_keep_text(ctype: bytes, payload: bytes, keep: frozenset):
+    """(category, keyword, fresh chunk) for a text chunk whose keyword and value pass the whitelist, else None."""
+    got = _png_text(ctype, payload)
+    if got is None:
+        return None
+    key, text = got
+    cat = _PNG_TEXT.get(key)
+    if cat not in keep or not text_ok(text, 2000 if cat == "descriptions" else 256):
+        return None
+    if cat == "dates" and not _date_text(text):
+        return None
+    try:
+        return cat, key, _png_chunk(b"tEXt", key.encode() + b"\x00" + text.encode("latin-1"))
+    except UnicodeEncodeError:
+        return cat, key, _png_chunk(b"iTXt", key.encode() + b"\x00\x00\x00\x00\x00" + text.encode())
+
+
+def clean_png(data: bytes, keep: frozenset = frozenset(), kept: set | None = None, warn=None) -> bytes:
+    """Keep only critical, colour and APNG chunks; drop tEXt/zTXt/iTXt/tIME/eXIf/C2PA/... and trailing data.
+
+    `keep` re-adds freshly written fields: an Exif block (exif_keep), tIME and the text keywords of the categories.
+    """
     n = len(data)
+    kept = set() if kept is None else kept
     if data[:8] != _PNG_SIG:
         raise WipeError("not a PNG (bad signature)")
     out = [_PNG_SIG]
+    late, keys = [], set()  # kept tIME/text chunks go right before IEND: legal in every chunk order, never between IDATs
     exif_done = False
     i = 8
     while i + 12 <= n:
@@ -157,17 +225,28 @@ def clean_png(data: bytes) -> bytes:
             raise WipeError("truncated PNG chunk")
         if ctype in _PNG_KEEP:
             out.append(data[i:end])
-        elif ctype in (b"eXIf", b"tEXt", b"zTXt") and not exif_done:
+        elif ctype in (b"eXIf", b"tEXt", b"zTXt", b"iTXt", b"tIME"):
             payload = data[i + 8:i + 8 + length]
-            orientation = tiff_orientation(payload) if ctype == b"eXIf" else _png_text_orientation(ctype, payload)
-            if orientation > 1:
-                exif_done = True
-                out.append(_png_chunk(b"eXIf", minimal_tiff(orientation)))
-            elif ctype == b"eXIf":
-                exif_done = True
+            if ctype == b"tIME":
+                if "dates" in keep and len(payload) == 7 and real_date(*struct.unpack(">HBBBBB", payload)) and "tIME" not in keys:
+                    keys.add("tIME")
+                    late.append(_png_chunk(ctype, payload))
+                    kept.add("dates")
+            elif keep and ctype != b"eXIf" and (got := _png_keep_text(ctype, payload, keep)) and got[1] not in keys:
+                keys.add(got[1])
+                late.append(got[2])
+                kept.add(got[0])
+            if ctype in (b"eXIf", b"tEXt", b"zTXt") and not exif_done:
+                tiff, cats = exif_keep(payload if ctype == b"eXIf" else _png_text_exif(ctype, payload), keep, warn)
+                if tiff:
+                    exif_done = True
+                    out.append(_png_chunk(b"eXIf", tiff))
+                    kept |= cats
+                elif ctype == b"eXIf":
+                    exif_done = True
         i = end
         if ctype == b"IEND":
-            return b"".join(out)
+            return b"".join(out[:-1] + late + out[-1:])
     raise WipeError("corrupt PNG: no IEND chunk")
 
 
@@ -176,13 +255,15 @@ def clean_png(data: bytes) -> bytes:
 _WEBP_KEEP = {b"VP8X", b"VP8 ", b"VP8L", b"ALPH", b"ANIM", b"ANMF", b"ICCP"}
 
 
-def clean_webp(data: bytes) -> bytes:
-    """Drop EXIF/XMP chunks (and clear their VP8X flags); frames, alpha and ICC are untouched."""
+def clean_webp(data: bytes, keep: frozenset = frozenset(), kept: set | None = None, warn=None) -> bytes:
+    """Drop EXIF/XMP chunks (and clear their VP8X flags); frames, alpha and ICC are untouched.
+    `keep` adds a freshly built EXIF chunk (exif_keep)."""
+    kept = set() if kept is None else kept
     if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
         raise WipeError("not a WebP file")
     end = min(len(data), 8 + int.from_bytes(data[4:8], "little"))
     chunks: list[bytearray] = []
-    orientation = 1
+    tiff, cats = None, set()
     i = 12
     while i + 8 <= end:
         fourcc = data[i:i + 4]
@@ -195,20 +276,22 @@ def clean_webp(data: bytes) -> bytes:
             if len(chunk) & 1:
                 chunk.append(0)
             chunks.append(chunk)
-        elif fourcc == b"EXIF" and orientation == 1:
+        elif fourcc == b"EXIF" and not tiff:
             payload = data[i + 8:i + 8 + size]
-            orientation = tiff_orientation(payload[6:] if payload[:6] == _EXIF_PREFIX else payload)
+            tiff, cats = exif_keep(payload[6:] if payload[:6] == _EXIF_PREFIX else payload, keep, warn)
         i = stop
     if not any(c[:4] in (b"VP8 ", b"VP8L", b"ANMF") for c in chunks):
         raise WipeError("corrupt WebP: no image data")
     if chunks and chunks[0][:4] == b"VP8X":
         chunks[0][8] &= ~(0x08 | 0x04)  # Exif, XMP flags
-        if orientation > 1:
-            tiff = minimal_tiff(orientation)
+        if tiff:
             chunks.append(bytearray(b"EXIF" + struct.pack("<I", len(tiff)) + tiff))
             if len(tiff) & 1:
                 chunks[-1].append(0)
             chunks[0][8] |= 0x08
+            kept |= cats
+    elif cats and warn:  # a plain lossy/lossless file has no VP8X header (canvas size) to flag the chunk
+        warn(f"{', '.join(c for c in KEEP if c in cats)} not kept: this WebP has no extended header to carry Exif")
     body = b"WEBP" + b"".join(bytes(c) for c in chunks)
     return b"RIFF" + struct.pack("<I", len(body)) + body
 
@@ -230,8 +313,11 @@ _TIFF_MAX_IFDS = 100000  # page stacks of 10000+ pages exist; each IFD is also c
 
 
 class _Tiff:
-    def __init__(self, data: bytes):
+    def __init__(self, data: bytes, keep: frozenset = frozenset()):
         self.buf = bytearray(data)
+        self.extra = {tag for (kind, tag), (cat, _) in _FIELDS.items() if kind == 0 and cat in keep}  # IFD0 fields to keep
+        self.cats: set = set()  # categories really kept (in kept page IFDs)
+        self._ok: dict = {}
         self.budget = 4 * len(data) + (1 << 20)  # bytes we may zero; guards crafted overlapping data
         self.work = 0
         self.seen: set = set()  # IFDs that are kept or already erased by the fallback
@@ -303,6 +389,22 @@ class _Tiff:
                 self._values[key] = got
         return got
 
+    def wanted(self, x) -> bool:
+        """Whitelisted tag, or an IFD0-level field of a kept category with a valid value (judged once, before any edit)."""
+        e, tag, typ, cnt, _ = x
+        if tag in _TIFF_KEEP:
+            return True
+        if tag not in self.extra:
+            return False
+        if e not in self._ok:
+            try:
+                self._ok[e] = _field(self, 0, tag, typ, cnt, e) is not None
+            except WipeError:  # value outside the file: dropped as before
+                self._ok[e] = False
+            if self._ok[e]:
+                self.cats.add(_FIELDS[0, tag][0])
+        return self._ok[e]
+
     def protect(self, ranges: list) -> None:
         """Remember what the kept structure uses; the fallback eraser must never touch it."""
         self._protected = sorted(ranges)
@@ -353,7 +455,7 @@ class _Tiff:
         next_ifd = self.u(old_end, 4)
         kept = []
         for e, tag, typ, cnt, size in entries:
-            if tag in _TIFF_KEEP:
+            if self.wanted((e, tag, typ, cnt, size)):
                 kept.append(bytes(self.buf[e:e + 12]))
                 continue
             if zero_dropped:
@@ -456,7 +558,7 @@ class _Tiff:
         done, covered = set(), {}  # shared strip tables: collected once; geometry verdicts per table
         reason = None
         for ifd in kept:
-            entries = [x for x in self.entries(ifd) if x[1] in _TIFF_KEEP]
+            entries = [x for x in self.entries(ifd) if self.wanted(x)]
             tables.append((ifd, ifd + 2 + 12 * len(self.entries(ifd)) + 4))
             kept_sizes.append((ifd, len(entries)))
             by = {tag: (e, typ, cnt, sz) for e, tag, typ, cnt, sz in entries}
@@ -543,16 +645,31 @@ class _Tiff:
             raise WipeError("internal error: TIFF size changed while cleaning")
 
 
-def clean_tiff(data: bytes, note=None) -> bytes:
+def clean_tiff(data: bytes, note=None, keep: frozenset = frozenset(), kept: set | None = None, warn=None) -> bytes:
     """Whitelist TIFF tags, unlink thumbnail-only IFDs, then zero all bytes nothing references any more.
 
-    `note` receives a message for everything identifying that could not be erased.
+    `note` receives a message for everything identifying that could not be erased. `keep` leaves the validated
+    IFD0-level fields of those categories in place (the in-place engine cannot carry the Exif/GPS sub-IFDs or the
+    thumbnail: `warn` says so); `kept` receives what was really kept.
     """
-    t = _Tiff(data)
+    t = _Tiff(data, keep)
     chain = t.ifd_chain()
     if not chain:
         raise WipeError("corrupt TIFF: no image IFD")
     kept_ifds = [ifd for n, ifd in enumerate(chain) if not t.is_thumbnail(chain, n)]
+    if keep and warn:
+        lost = {"thumbnails"} if len(kept_ifds) < len(chain) else set()
+        for ifd in kept_ifds:
+            by = t.tags_of(ifd)
+            for kind, tag in _SUB_TAGS.items():
+                try:
+                    if tag in by and by[tag][1:3] == (4, 1):
+                        lost |= {_FIELDS[kind, g][0] for g in t.tags_of(t.u(by[tag][0] + 8, 4)) if (kind, g) in _FIELDS}
+                except WipeError:  # a damaged sub-IFD is simply not kept
+                    pass
+        for cat in KEEP:
+            if cat in keep & lost:
+                warn(f"{cat} not kept: a TIFF only keeps its main tags, not the Exif/GPS sub-IFDs or the thumbnail")
     ranges, reason = t.referenced(kept_ifds)  # read-only analysis of the original structure
     t.protect(ranges)
     old_jpeg = any(513 in t.tags_of(ifd) or t.scalar(t.tags_of(ifd), 259, 1) == 6 for ifd in kept_ifds)
@@ -573,14 +690,196 @@ def clean_tiff(data: bytes, note=None) -> bytes:
         note(f"{reason}; stale data between structures could not be erased")
     if note and old_jpeg:
         note("TIFF holds an old-style JPEG stream; Exif/XMP/comment segments inside it were not cleaned")
+    if kept is not None:
+        kept |= t.cats
     return bytes(t.buf)
+
+
+# ---------------------------------------------------------------- Exif rebuild (--keep)
+
+# (IFD, tag) -> (category, value rule). IFD 0 = IFD0, 1 = Exif IFD, 2 = GPS IFD (rule = exact (type, count)).
+# Anything not listed (MakerNote, Interop, camera settings, unknown tags) is never copied.
+_FIELDS: dict = {}
+for _kind, _cat, _rule, _tags in (
+        (0, "dates", "date", (306,)), (0, "device", "text", (271, 272, 316)), (0, "software", "text", (305, 11)),
+        (0, "people", "text", (315, 33432)), (0, "people", "xp", (40093,)), (0, "descriptions", "desc", (270, 269)),
+        (0, "descriptions", "xp", (40091, 40092, 40094, 40095)),
+        (1, "dates", "date", (36867, 36868)), (1, "dates", "sub", (37520, 37521, 37522)),
+        (1, "dates", "off", (36880, 36881, 36882)), (1, "device", "text", (42033, 42035, 42036, 42037)),
+        (1, "device", "lens", (42034,)), (1, "people", "text", (42032,)), (1, "descriptions", "ucomment", (37510,))):
+    _FIELDS.update({(_kind, _t): (_cat, _rule) for _t in _tags})
+# numeric GPS tags only (no Satellites, MapDatum, ProcessingMethod, AreaInformation: free text)
+_FIELDS.update({(2, tag): ("dates" if tag in (7, 29) else "location", spec) for tag, spec in {
+    1: (2, 2), 2: (5, 3), 3: (2, 2), 4: (5, 3), 5: (1, 1), 6: (5, 1), 7: (5, 3), 9: (2, 2), 10: (2, 2), 11: (5, 1),
+    12: (2, 2), 13: (5, 1), 14: (2, 2), 15: (5, 1), 16: (2, 2), 17: (5, 1), 19: (2, 2), 20: (5, 3), 21: (2, 2),
+    22: (5, 3), 23: (2, 2), 24: (5, 1), 25: (2, 2), 26: (5, 1), 29: (2, 11), 30: (3, 1), 31: (5, 1)}.items()})
+_RULES = {"date": (2, 20), "sub": (2, 10), "off": (2, 7), "text": (2, 257), "desc": (2, 2001), "xp": (1, 4002),
+          "ucomment": (7, 4010), "lens": (5, 4)}  # (type, max count)
+_EXIF_PARTS = {1: {"dates", "device", "people", "descriptions"}, 2: {"dates", "location"}}  # sub-IFDs and who needs them
+_SUB_TAGS = {1: 34665, 2: 34853}
+
+
+def _exif_date(text: str) -> bool:
+    m = _EXIF_DATE.fullmatch(text)
+    return bool(m) and real_date(*m.groups())
+
+
+_CHECKS = {"date": _exif_date, "sub": re.compile("[0-9]{1,9}").fullmatch, "off": re.compile(r"[+-](?:0[0-9]|1[0-4]):[0-5][0-9]").fullmatch}
+
+
+def _field(t: _Tiff, kind: int, tag: int, typ: int, cnt: int, e: int):
+    """(type, count, big-endian value) of a whitelisted Exif field, None when type, count or value do not fit."""
+    rule = _FIELDS[kind, tag][1]
+    gps = isinstance(rule, tuple)
+    want, most = rule if gps else _RULES[rule]
+    if typ != want or not 0 < cnt <= most or gps and cnt != most:
+        return None
+    size = _TIFF_TYPE_SIZE[typ] * cnt
+    off = e + 8 if size <= 4 else t.u(e + 8, 4)
+    if off + size > len(t.buf):
+        raise WipeError("truncated TIFF")
+    raw = bytes(t.buf[off:off + size])
+    if typ in (3, 5):  # SHORT (GPSDifferential), RATIONAL (a zero denominator is only valid as 0/0 in a lens specification)
+        code = "I" if typ == 5 else "H"
+        nums = struct.unpack(f"{t.fmt}{len(raw) // (4 if typ == 5 else 2)}{code}", raw)
+        if typ == 3 and nums[0] > 1 or typ == 5 and any(not d and (n or rule != "lens") for n, d in zip(nums[::2], nums[1::2])):
+            return None
+        if (kind, tag) == (2, 7) and any(n >= d * lim for n, d, lim in zip(nums[::2], nums[1::2], (24, 60, 60))):
+            return None  # GPSTimeStamp must be a time of day
+        return typ, cnt, struct.pack(f">{len(nums)}{code}", *nums)
+    if gps:  # AltitudeRef byte, reference letter, date stamp: copied only when they look exactly like that
+        ok = (raw[0] in (0, 1) if typ == 1 else raw[0] < 128 and chr(raw[0]).isalpha() and raw[1] == 0 if cnt == 2
+              else raw[10] == 0 and _exif_date(raw[:10].decode("latin-1") + " 00:00:00"))
+        return (typ, cnt, raw) if ok else None
+    head, tail, enc = b"", b"\0", "utf-8"
+    try:
+        if rule == "xp":  # UTF-16LE in a BYTE array
+            enc, tail, text = "utf-16-le", b"\0\0", raw.decode("utf-16-le")
+        elif rule == "ucomment":  # 8-byte charset id, then the text (rewritten in the byte order of the new block)
+            head, body = raw[:8], raw[8:]
+            tail = b""
+            if head == b"UNICODE\0":
+                enc, text = "utf-16-be", body.decode("utf-16-" + ("be" if t.order == "big" else "le"))
+            elif head in (b"ASCII\0\0\0", bytes(8)):
+                text = body.decode("utf-8")
+            else:
+                return None
+        else:
+            text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    text = text.rstrip("\0")
+    if not text_ok(text, 2000 if rule in ("desc", "xp", "ucomment") else 256) \
+            or rule in _CHECKS and not _CHECKS[rule](text):
+        return None
+    value = head + text.encode(enc) + tail
+    return typ, len(value), value
+
+
+def _emit(entries: list, base: int, ptrs: dict, nxt: int) -> bytes:
+    """One IFD at offset `base`; an entry's value None means 'offset of the IFD/thumbnail named by ptrs[tag]'."""
+    entries = sorted(entries, key=lambda x: x[0])
+    table, values = [], b""
+    for tag, typ, cnt, data in entries:
+        data = struct.pack(">I", ptrs[tag]) if data is None else data
+        if len(data) > 4:
+            slot = struct.pack(">I", base + 6 + 12 * len(entries) + len(values))
+            values += data + b"\0" * (len(data) & 1)
+        else:
+            slot = data.ljust(4, b"\0")
+        table.append(struct.pack(">HHI", tag, typ, cnt) + slot)
+    return struct.pack(">H", len(entries)) + b"".join(table) + struct.pack(">I", nxt) + values
+
+
+def _isize(entries: list) -> int:
+    return 6 + 12 * len(entries) + sum(len(d) + (len(d) & 1) for _, _, _, d in entries if d and len(d) > 4)
+
+
+def _exif_build(ifds: dict, thumb: bytes | None) -> bytes:
+    """Big-endian TIFF from {0: IFD0, 1: Exif IFD, 2: GPS IFD} entry lists (+ an IFD1 holding the JPEG thumbnail)."""
+    ifd0 = list(ifds[0])
+    sub = {k: ifds[k] for k in (1, 2) if ifds[k]}
+    ifd1 = [(259, 3, 1, struct.pack(">H", 6)), (513, 4, 1, None), (514, 4, 1, struct.pack(">I", len(thumb)))] if thumb else []
+    ifd0 += [(_SUB_TAGS[k], 4, 1, None) for k in sub]
+    order = [ifd0, *sub.values(), *([ifd1] if ifd1 else [])]
+    offs, pos = [], 8
+    for g in order:
+        offs.append(pos)
+        pos += _isize(g)
+    ptrs = {_SUB_TAGS[k]: offs[n + 1] for n, k in enumerate(sub)} | {513: pos}
+    body = b"".join(_emit(g, offs[n], ptrs, offs[-1] if ifd1 and g is ifd0 else 0) for n, g in enumerate(order))
+    return b"MM\x00\x2a" + struct.pack(">I", 8) + body + (thumb or b"")
+
+
+def _exif_read(tiff: bytes, keep: frozenset, orientation: int, warn, limit):
+    t = _Tiff(tiff)
+    ifd0 = t.u(4, 4)
+    if ifd0 < 8:
+        raise WipeError("corrupt TIFF: bad IFD offset")
+    top = t.entries(ifd0)
+    by = t.tags_of(ifd0)
+    ifds, cats = {0: [(274, 3, 1, struct.pack(">H", orientation))] if orientation > 1 else [], 1: [], 2: []}, set()
+    passes = [(0, ifd0)] + [(k, t.u(by[tag][0] + 8, 4)) for k, tag in _SUB_TAGS.items()
+                            if tag in by and keep & _EXIF_PARTS[k] and by[tag][1:3] == (4, 1)]
+    for kind, ifd in passes:
+        seen = set()
+        for e, tag, typ, cnt, _ in t.entries(ifd):
+            cat = _FIELDS.get((kind, tag), (None,))[0]
+            if cat in keep and tag not in seen:
+                seen.add(tag)
+                if got := _field(t, kind, tag, typ, cnt, e):
+                    ifds[kind].append((tag, *got))
+                    cats.add(cat)
+    if ifds[2]:
+        ifds[2].append((0, 1, 4, b"\x02\x03\x00\x00"))
+    thumb = None
+    if "thumbnails" in keep and (nxt := t.u(ifd0 + 2 + 12 * len(top), 4)):
+        one = t.tags_of(nxt)
+        start, size = t.scalar(one, 513, 0), t.scalar(one, 514, 0)
+        if 0 < size and start + size <= len(tiff) and tiff[start:start + 2] == b"\xff\xd8":
+            try:
+                thumb = clean_jpeg(tiff[start:start + size])
+            except WipeError:
+                warn("thumbnails not kept: the Exif thumbnail is not a valid JPEG")
+    if not cats and not thumb:
+        return None, set()
+    out = _exif_build(ifds, thumb)
+    if limit and len(out) > limit:
+        if thumb:
+            warn("thumbnails not kept: the Exif block would be too large")
+            thumb, out = None, _exif_build(ifds, None)
+        if len(out) > limit:
+            raise WipeError("Exif block too large")
+    return out, cats | ({"thumbnails"} if thumb else set())
+
+
+def exif_keep(tiff: bytes, keep: frozenset, warn=None, limit: int | None = None):
+    """Fresh minimal Exif block (big-endian TIFF, no 'Exif\\0\\0' prefix) for the Exif/TIFF data `tiff`.
+
+    Returns (block or None, categories really kept). With an empty `keep` the block is just Orientation (None when
+    it is 1, as always). Otherwise it holds Orientation plus the whitelisted, validated fields of the categories in
+    `keep` (see _FIELDS; GPS 7/29 count as dates, the rest of the GPS IFD as location) and, for "thumbnails",
+    the Exif thumbnail cleaned by clean_jpeg. Nothing is ever copied wholesale. `limit` caps the block size (a
+    JPEG APP1 holds 65527 bytes after the Exif prefix); the thumbnail is dropped first. On any parse problem it
+    falls back to the Orientation-only block and calls `warn` once.
+    """
+    warn = warn or (lambda msg: None)
+    orientation = tiff_orientation(tiff)
+    if keep and tiff:
+        try:
+            block, cats = _exif_read(tiff, keep, orientation, warn, limit)
+            if block:
+                return block, cats
+        except (WipeError, struct.error, ValueError, OverflowError):
+            warn("Exif data could not be read safely: none of it was kept")
+    return (minimal_tiff(orientation) if orientation > 1 else None), set()
 
 
 # ---------------------------------------------------------------- handlers
 
 def _bytes_handler(fn):
     def handler(src: Path, dst: Path, ctx: Context) -> None:
-        dst.write_bytes(fn(src.read_bytes()))
+        dst.write_bytes(fn(src.read_bytes(), ctx.keep, ctx.kept, ctx.warn))
     return handler
 
 
@@ -590,7 +889,7 @@ webp = _bytes_handler(clean_webp)
 
 
 def tiff(src: Path, dst: Path, ctx: Context) -> None:
-    dst.write_bytes(clean_tiff(src.read_bytes(), ctx.leftover))
+    dst.write_bytes(clean_tiff(src.read_bytes(), ctx.leftover, ctx.keep, ctx.kept, ctx.warn))
 
 
 # By extension, for pictures embedded in other documents.

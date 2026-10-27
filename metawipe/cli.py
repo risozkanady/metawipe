@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import __version__, images, isobmff, office, pdf, video
-from .common import Context, WipeError
+from .common import KEEP, Context, WipeError
 
 HANDLERS = {
     ".jpg": images.jpeg, ".jpeg": images.jpeg, ".jpe": images.jpeg,
@@ -219,14 +219,16 @@ def _os_error_for(e: OSError, tmp: Path, dst: Path) -> OSError:
     return new
 
 
-def _finish(tmp: Path, st: os.stat_result, inplace: bool, full: bool) -> None:
+def _finish(tmp: Path, st: os.stat_result, inplace: bool, full: bool, keep_dates: bool = False) -> None:
     """Permissions, owner and mtime of the finished temp file, applied through an open descriptor so a path swapped
-    for a symlink or a hard link (the directory may belong to somebody else when running as root) cannot redirect them."""
+    for a symlink or a hard link (the directory may belong to somebody else when running as root) cannot redirect them.
+    keep_dates (--keep dates) copies the original's access/modification time; it wins over --full's 1980."""
     mode = stat.S_IMODE(st.st_mode) & 0o777  # no setuid/setgid/sticky on outputs
+    times = {"ns": (st.st_atime_ns, st.st_mtime_ns)} if keep_dates else {"times": (_FULL_MTIME, _FULL_MTIME)} if full else None
     if os.name == "nt":
         os.chmod(tmp, mode)
-        if full:
-            os.utime(tmp, (_FULL_MTIME, _FULL_MTIME))
+        if times:
+            os.utime(tmp, **times)
         return
     fd = os.open(tmp, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
@@ -240,15 +242,16 @@ def _finish(tmp: Path, st: os.stat_result, inplace: bool, full: bool) -> None:
                 os.fchown(fd, st.st_uid if os.geteuid() == 0 else -1, st.st_gid)
             except OSError:
                 pass
-        if full:
-            os.utime(fd, (_FULL_MTIME, _FULL_MTIME))
+        if times:
+            os.utime(fd, **times)
         os.fsync(fd)  # data on disk before the rename, or a power loss can leave an empty file in place of the original
     finally:
         os.close(fd)
 
 
 def _run(job: Job, args, warn=None) -> Context:
-    ctx = Context(password=args.password, full=args.full,
+    keep = getattr(args, "keep", frozenset())  # the TUI and tests build args by hand
+    ctx = Context(password=args.password, full=args.full, keep=keep,
                   warn=warn or (lambda msg: print(f"warn   {job.src}: {msg}", file=sys.stderr)))
     created = _missing_dirs(job.dst.parent)
     job.dst.parent.mkdir(parents=True, exist_ok=True)
@@ -263,8 +266,10 @@ def _run(job: Job, args, warn=None) -> Context:
         tmp = Path(tmp_name)
         try:
             _handler(job.src)(job.src, tmp, ctx)
-            _finish(tmp, job.src.stat(), job.inplace, args.full)
+            _finish(tmp, job.src.stat(), job.inplace, args.full, "dates" in keep)
             os.replace(tmp, job.dst)
+            if "dates" in keep:
+                ctx.kept.add("dates")  # at least the file's modification time
         except WipeError as e:
             raise WipeError(_hide_temp(str(e), tmp, job.dst)) from e
         except Exception as e:
@@ -323,6 +328,11 @@ def main(argv=None) -> int:
         "full scrub: also anonymise comment/revision authors and dates, clean pictures embedded in "
         "documents, drop customXml/printer settings, remove H.264/HEVC encoder strings (x264/x265 SEI), set mtime to 1980; "
         "exit status 2 if something identifying had to be left"))
+    ap.add_argument("--keep", type=_keep_list, default=frozenset(), metavar="LIST", help=(
+        f"leave these kinds of metadata in, comma-separated: {', '.join(KEEP)} or all. Kept values are copied one by one "
+        "(never a whole Exif/XMP block), everything else is still removed; formats that cannot keep a kind say so. "
+        "'dates' also keeps the file's modification time (instead of now, or 1980 with --full); "
+        "with --full a kept kind is also spared by its full-scrub step (comment authors, comment dates, x264/x265 SEI, PDF thumbnails)"))
     ap.add_argument("--show", action="store_true", help="only list everything each file carries (writes nothing)")
     ap.add_argument("-v", "--verbose", action="store_true", help="also list skipped files")
     ap.add_argument("--version", action="version", version=f"metawipe {__version__}")
@@ -386,6 +396,19 @@ def _show(args) -> int:
     return status
 
 
+def kept_note(ctx: Context) -> str:
+    return f" (kept: {', '.join(c for c in KEEP if c in ctx.kept)})" if ctx.kept else ""
+
+
+def _keep_list(text: str) -> frozenset:
+    names = {n.strip().lower() for n in text.split(",") if n.strip()}
+    if "all" in names:
+        return frozenset(KEEP)
+    if names - set(KEEP):
+        raise argparse.ArgumentTypeError(f"unknown: {', '.join(sorted(names - set(KEEP)))} (choose from {', '.join(KEEP)}, all)")
+    return frozenset(names)
+
+
 def _main(args, report: Report) -> int:
     jobs = plan(args, report)
     for job in jobs:
@@ -402,7 +425,7 @@ def _main(args, report: Report) -> int:
             if args.full and ctx.residue:
                 report.incomplete += 1
                 partial = f" (INCOMPLETE: {len(ctx.residue)} item(s) left, see warnings)"
-            print(f"clean  {job.src} {target}{partial}")
+            print(f"clean  {job.src} {target}{partial}{kept_note(ctx)}")
     summary = f"done: {report.cleaned} cleaned, {report.failed} failed, {report.skipped} skipped"
     if args.full:
         summary += f", {report.incomplete} incomplete"
