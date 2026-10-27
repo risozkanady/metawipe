@@ -1,11 +1,12 @@
 # Tests on Linux, Windows and macOS, then builds single-file executables (PyInstaller).
 # Push a tag vX.Y.Z (matching metawipe.__version__) to publish them as a GitHub release with a Homebrew formula;
-# "Run workflow" on any branch only builds them (downloadable from the run page).
+# A push to testing (or "Run workflow") only builds them (downloadable from the run page).
 name: release
 
 on:
   push:
     tags: ["v*"]
+    branches: [testing]
   workflow_dispatch:
 
 permissions:
