@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 
-from rich.markup import escape
 from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
@@ -25,6 +25,34 @@ INK, SLATE, PANEL, PAPER = "#17202b", "#1e2937", "#263446", "#e6e9ee"
 STEEL, CORAL, AMBER, SEA, MUTED = "#7aa2d6", "#e8766c", "#e3b23c", "#62b7a0", "#8696aa"
 THEME = Theme(name="metawipe", primary=STEEL, secondary="#8c8fd6", warning=AMBER, error=CORAL, success=SEA, accent=AMBER,
               foreground=PAPER, background=INK, surface=SLATE, panel=PANEL, dark=True)
+
+DEFAULT_THEME = "metawipe"
+
+
+def config_path() -> Path:
+    """$XDG_CONFIG_HOME/metawipe/config.json (default ~/.config/metawipe/config.json)."""
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return Path(base) / "metawipe" / "config.json"
+
+
+def load_config() -> dict:
+    """Saved settings; a missing or broken file means defaults."""
+    try:
+        data = json.loads(config_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_config(**changes) -> None:
+    """Merge changes into the config file (atomic replace, keeps keys it does not know)."""
+    path = config_path()
+    data = {**load_config(), **changes}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
 
 _WHERE_OR_WHO = ("gps", "location", "coordinates", "author", "creator", "artist", "owner", "company", "manager", "people", "printer", "signature")
 _DEVICE = ("make", "model", "lens", "serial", "software", "host", "application", "makernote", "xmp", "iptc", "photoshop",
@@ -115,7 +143,9 @@ HELP = """[b]metawipe[/b] - removes identifying metadata (location, device, auth
   a  mark all supported files in this folder      c  clear all marks
   r  clean everything marked (marks clear)        f  toggle full scrub
   v  preview: switch between "what it reveals" and [b]everything[/b] the file carries (scrolls; sections in blue)
+  F5  reload the file tree (also happens after every run)
   F1 or ?  this help                              q  quit            Tab  jump between tree and options
+  Ctrl+P  command palette: "Change theme" - the chosen theme is remembered in ~/.config/metawipe/config.json
 
 [b]Options[/b]
   [b]Full scrub (--full)[/b]  on: also anonymise authors/dates of comments and tracked changes, clean pictures embedded in
@@ -164,11 +194,11 @@ class TuiReport(cli.Report):
     def fail(self, path, msg: str) -> None:
         self.failed += 1
         self.mark_failed(Path(path))
-        self.emit(f"[red]error[/]  {escape(str(path))}: {escape(msg)}")
+        self.emit(Text.assemble(("error", "red"), f"  {path}: {msg}"))
 
     def skip(self, path, why: str) -> None:
         self.skipped += 1
-        self.emit(f"[dim]skip   {escape(str(path))} ({escape(why)})[/]")
+        self.emit(Text(f"skip   {path} ({why})", style="dim"))
 
 
 class MetawipeApp(App):
@@ -195,13 +225,15 @@ class MetawipeApp(App):
         Binding("r", "run", "Run"),
         Binding("f", "toggle_full", "Full scrub"),
         Binding("v", "toggle_view", "Everything"),
+        Binding("f5", "reload_tree", "Reload"),
         Binding("f1,question_mark", "help", "Help"),
         Binding("q", "quit", "Quit"),
     ]
 
     def __init__(self, start: Path | None = None):
         super().__init__()
-        self.start = Path(start or Path.cwd())
+        # resolved like the tree resolves the folders it opens (macOS: /tmp -> /private/tmp), so paths stay comparable
+        self.start = Path(start or Path.cwd()).expanduser().resolve()
         self.marks: set[Path] = set()
         self.highlighted: Path | None = None
         self.view_all = False  # preview: what the file reveals (summary) or every metadata entry it carries
@@ -233,7 +265,10 @@ class MetawipeApp(App):
 
     def on_mount(self) -> None:
         self.register_theme(THEME)
-        self.theme = "metawipe"
+        self._saved_theme = load_config().get("theme", DEFAULT_THEME)
+        known = isinstance(self._saved_theme, str) and self._saved_theme in self.available_themes
+        self.theme = self._saved_theme if known else DEFAULT_THEME
+        self.theme_changed_signal.subscribe(self, self._remember_theme)
         self.query_one("#left").border_title = Text(str(self.start))
         table = self.query_one("#preview", DataTable)
         table.add_column("found", width=26)
@@ -245,7 +280,9 @@ class MetawipeApp(App):
         self.log_line("Mark files with [b]space[/] or [b]m[/] and press [b]r[/]. Folders are cleaned recursively. [b]F1[/] explains everything here.")
 
     # ------------------------------------------------------------------ helpers
-    def log_line(self, text: str) -> None:
+    def log_line(self, text: str | Text) -> None:
+        """str: our own words with markup; anything from the disk (paths, metadata, errors) goes in as Text, never parsed
+        (rich.markup.escape is not enough: a Windows path like C:\\x\\[1] loses its backslash)."""
         self.query_one("#log", RichLog).write(text)
 
     def _short(self, path: Path) -> str:
@@ -260,6 +297,20 @@ class MetawipeApp(App):
         if invalidate is not None:
             invalidate()
         tree.refresh()
+
+    def action_reload_tree(self) -> None:
+        """Re-read the folders from disk: new copies, output folders and outside changes show up (open folders stay open)."""
+        self.query_one("#tree", MarkTree).reload()
+
+    def _remember_theme(self, theme: Theme) -> None:
+        if theme.name == self._saved_theme:
+            return
+        try:
+            save_config(theme=theme.name)
+        except OSError as e:
+            self.notify(f"Could not save the theme to {config_path()}: {e}", severity="warning", markup=False)
+            return
+        self._saved_theme = theme.name
 
     # ------------------------------------------------------------------ marking
     def _marks_changed(self) -> None:
@@ -300,7 +351,7 @@ class MetawipeApp(App):
         found = [p for p in sorted(folder.iterdir()) if p.is_file() and cli.HANDLERS.get(p.suffix.lower())]
         self.marks.update(found)
         self._marks_changed()
-        self.log_line(f"marked {len(found)} supported file(s) in {escape(str(folder))}")
+        self.log_line(Text(f"marked {len(found)} supported file(s) in {folder}"))
 
     def action_clear_marks(self) -> None:
         self.marks.clear()
@@ -425,7 +476,7 @@ class MetawipeApp(App):
         incomplete = 0
         for job in jobs:
             try:
-                ctx = cli.execute(job, args, warn=lambda msg, j=job: emit(f"[yellow]warn[/]   {escape(j.src.name)}: {escape(msg)}"))
+                ctx = cli.execute(job, args, warn=lambda msg, j=job: emit(Text.assemble(("warn", "yellow"), f"   {j.src.name}: {msg}")))
             except WipeError as e:
                 report.fail(job.src, str(e))
                 continue
@@ -439,10 +490,11 @@ class MetawipeApp(App):
             if args.full and ctx.residue:
                 incomplete += 1
                 self.call_from_thread(self.states.__setitem__, job.src, "incomplete")
-                note = f" [yellow](INCOMPLETE: {len(ctx.residue)} item(s) left)[/]"
-            emit(f"[green]clean[/]  {escape(self._short(job.src))} -> {'in place' if job.inplace else escape(self._short(job.dst))}{note}")
+                note = f" (INCOMPLETE: {len(ctx.residue)} item(s) left)"
+            emit(Text.assemble(("clean", "green"), f"  {self._short(job.src)} -> {'in place' if job.inplace else self._short(job.dst)}",
+                               (note, "yellow")))
             if left:
-                emit("        still carries: " + ", ".join(escape(k) for k, _ in left[:6]) + (" ..." if len(left) > 6 else ""))
+                emit(Text("        still carries: " + ", ".join(k for k, _ in left[:6]) + (" ..." if len(left) > 6 else "")))
         emit(f"[b]done:[/] {report.cleaned} cleaned, {report.failed} failed, {report.skipped} skipped" + (f", {incomplete} incomplete" if args.full else ""))
         self.call_from_thread(self._run_finished, args)
         if self.highlighted is not None:
@@ -452,6 +504,7 @@ class MetawipeApp(App):
     def _run_finished(self, args: argparse.Namespace) -> None:
         self.marks.difference_update(map(Path, args.paths))  # the outcome now shows in the tree; marks made during the run stay
         self._marks_changed()
+        self.action_reload_tree()  # the run made new files/folders (NAME.clean.EXT, the output folder)
 
 
 def run(start: str | os.PathLike | None = None) -> int:

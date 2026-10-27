@@ -443,6 +443,7 @@ class CliFixTests(Base):
         Path(path).write_bytes(png_bytes([(b"tEXt", b"k\x00" + SECRET)]))
         return Path(path)
 
+    @unittest.skipIf(os.name == "nt", "no owners to give back on Windows")
     def test_root_gives_in_place_file_back_to_its_owner(self):
         p = self.png(self.dir / "a.png")
         st = p.stat()
@@ -534,7 +535,7 @@ class CliFixTests(Base):
         rc, out, err = run("-r", "-o", self.dir / "o2", "-f", src)
         self.assertIn("0 skipped", out)
 
-    @unittest.skipIf(os.geteuid() == 0, "root ignores permissions")
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "root (and Windows) ignore these permission bits")
     def test_no_temp_names_when_directory_is_not_writable(self):
         ro = self.dir / "ro"
         ro.mkdir()

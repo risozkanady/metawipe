@@ -340,6 +340,7 @@ class CliRegression(Base):
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(out.count("clean  "), 2)
 
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "no FIFOs here")
     def test_scan_skips_sidecars_fifos_and_notes_subdirectories(self):
         self.png(self.dir / "a.png")
         self.png(self.dir / "._a.png")
@@ -351,6 +352,7 @@ class CliRegression(Base):
         self.assertIn("not a regular file", out)
         self.assertIn("1 cleaned", out)
 
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "no FIFOs here")
     def test_fifo_given_explicitly_fails_fast(self):
         os.mkfifo(self.dir / "pipe.jpg")
         rc, out, err = run(self.dir / "pipe.jpg")
@@ -367,7 +369,7 @@ class CliRegression(Base):
         self.assertNotIn(SECRET, real.read_bytes())
         self.assertTrue(link.is_symlink())
 
-    @unittest.skipIf(os.geteuid() == 0, "root ignores permissions")
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "root (and Windows) ignore these permission bits")
     def test_read_only_file_is_not_replaced_in_place(self):
         p = self.dir / "a.png"
         self.png(p)
@@ -377,6 +379,7 @@ class CliRegression(Base):
         self.assertIn("read-only", err)
         self.assertIn(SECRET, p.read_bytes())
 
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
     def test_setuid_bits_not_copied_and_failed_job_leaves_no_empty_output_dirs(self):
         p = self.dir / "a.png"
         self.png(p)
@@ -389,6 +392,7 @@ class CliRegression(Base):
         self.assertFalse((self.dir / "o").exists())
         self.assertNotIn(".metawipe-", err)
 
+    @unittest.skipIf(os.name == "nt", "SIGTERM kills a Windows process outright")
     def test_sigterm_removes_temp_files(self):
         p = self.dir / "big.png"
         self.png(p)

@@ -13,6 +13,19 @@ Command-line tool that strips identifying metadata from files before you share t
 
 ## Install
 
+Ready-made executables (Python and the TUI included, nothing else to install):
+
+- **macOS / Linux with Homebrew:** `brew install risozkanady/metawipe/metawipe`
+- **Windows:** `metawipe-VERSION-windows-x86_64.zip` from [Releases](https://github.com/risozkanady/metawipe/releases);
+  unzip and run `metawipe.exe` (double-click opens the TUI). The file is not signed, so SmartScreen asks once
+  ("More info" → "Run anyway").
+- **Linux:** `metawipe-VERSION-linux-x86_64.tar.gz` from [Releases](https://github.com/risozkanady/metawipe/releases);
+  unpack and put `metawipe` on the PATH.
+
+Building one yourself: `pip install '.[tui]' pyinstaller && packaging/build.sh` (result in `dist/`).
+
+From source:
+
 ```
 git clone https://github.com/wspnowpartnerGAUC/metawipe && cd metawipe
 python3 -m venv .venv && source .venv/bin/activate
@@ -23,6 +36,8 @@ Videos need `ffmpeg` (with `ffprobe`) on the PATH (`brew install ffmpeg`, `pacma
 `--full` on a video refuses to run without `ffprobe`. Everything else is pure Python.
 For the interactive TUI (`metawipe --tui`) install with `pip install '.[tui]'`.
 In the TUI, `v` switches the preview between what the file reveals and everything it carries.
+The file tree reloads after every run (and on `F5`), so new `NAME.clean.EXT` copies and output folders show up.
+A theme picked with `Ctrl+P` → "Change theme" is remembered in `~/.config/metawipe/config.json` (`$XDG_CONFIG_HOME` is respected).
 
 ## Usage
 
@@ -120,4 +135,4 @@ python -m unittest discover -s tests -t . -v
 ```
 
 Tests that need `ffmpeg`, `heif-enc` or `exiv2` are skipped when those tools are missing.
-Tested on Linux with Python 3.14.
+Tested on Linux with Python 3.14. macOS and Windows should work (pure Python) but are untested.

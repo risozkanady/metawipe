@@ -33,6 +33,7 @@ class Job:
     src: Path
     dst: Path
     inplace: bool
+    explicit: bool = True  # named on the command line, not found by scanning a directory
 
 
 _FULL_MTIME = 315532800  # 1980-01-01T00:00:00Z
@@ -100,7 +101,7 @@ def _collect(args, report: Report) -> list[Job]:
             if m and (src.parent / (m["stem"] + m["ext"])).exists():
                 report.skip(src, "looks like the output of an earlier run")
                 return
-        jobs.append(Job(src, _dst_for(src, root, args), args.in_place))
+        jobs.append(Job(src, _dst_for(src, root, args), args.in_place, explicit))
 
     def scan_error(err: OSError) -> None:
         report.fail(err.filename, f"cannot read directory: {err.strerror}")
@@ -177,6 +178,9 @@ def _validate(jobs: list[Job], args, report: Report) -> list[Job]:
                 report.fail(job.src, f"output {job.dst} would overwrite the output for {claimed[dst_key]}")
                 continue
             if os.path.lexists(job.dst) and not args.force:
+                if not job.explicit:  # a rerun over the same folder: already done, not an error
+                    report.skip(job.src, f"{job.dst} already exists (use --force to redo)")
+                    continue
                 report.fail(job.src, f"{job.dst} already exists (use --force to overwrite)")
                 continue
             claimed[dst_key] = job.src
@@ -208,7 +212,9 @@ def _os_error_for(e: OSError, tmp: Path, dst: Path) -> OSError:
     first, second = (_hide_temp(str(n), tmp, dst) if n is not None else None for n in (e.filename, e.filename2))
     if second == first:
         second = None
-    new = type(e)(e.errno, e.strerror, first, None, second)
+    new = type(e)(e.errno, e.strerror, first)  # not the 5-argument form: Windows prints its None as "[WinError None]"
+    if second is not None:
+        new.filename2 = second
     new.__cause__ = e
     return new
 

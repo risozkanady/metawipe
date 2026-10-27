@@ -13,7 +13,7 @@ import re
 from pathlib import Path
 
 from . import images
-from .common import Context, WipeError
+from .common import Context, WipeError, quiet_pypdf
 
 _INFO_KEYS = {"/Title", "/Author", "/Subject", "/Keywords", "/Creator", "/Producer", "/CreationDate", "/ModDate", "/Trapped"}
 _INFO_IDENTITY = _INFO_KEYS - {"/Title", "/Subject", "/Keywords", "/Trapped"}
@@ -337,6 +337,7 @@ def _full_checks(obj, ctx: Context, notes: set[str], page: bool) -> None:
         notes.add("inline JPEG images in page content")
 
 
+@quiet_pypdf()
 def clean_pdf(src: Path, dst: Path, ctx: Context) -> None:
     try:
         from pypdf import PdfReader, PdfWriter

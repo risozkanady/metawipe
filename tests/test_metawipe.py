@@ -8,6 +8,7 @@ import shutil
 import stat
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -641,8 +642,9 @@ class CliTests(Base):
         rc, out, err = run(self.dir)
         self.assertEqual(rc, 0, err)
         self.assertTrue((self.dir / "my.clean.clean.png").exists())
-        rc, out, err = run(self.dir)  # second run: *.clean.* with an existing source are outputs
-        self.assertIn("1 skipped", out)
+        rc, out, err = run(self.dir)  # second run: nothing left to do (my.clean.png is done, my.clean.clean.png is its output)
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("0 cleaned, 0 failed, 2 skipped", out)
         self.assertFalse((self.dir / "my.clean.clean.clean.png").exists())
 
     def test_lock_files_ignored_and_duplicates_cleaned_once(self):
@@ -660,7 +662,7 @@ class CliTests(Base):
         self.assertIn("not found", err)
         self.assertIn("done:", out)
 
-    @unittest.skipIf(os.name == "nt", "Windows names are UTF-16")
+    @unittest.skipIf(os.name == "nt" or sys.platform == "darwin", "Windows and macOS names must be valid Unicode")
     def test_non_utf8_filename(self):
         name = os.fsdecode(b"caf\xe9.png")
         p = self.dir / name

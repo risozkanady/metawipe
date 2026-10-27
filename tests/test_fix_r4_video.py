@@ -231,13 +231,19 @@ class DestinationErrors(Base):
         path.write_bytes(png_bytes())
         return path
 
+    @staticmethod
+    def is_a_directory(src, dst):
+        if os.name == "nt":  # replacing a directory is "access denied" there
+            return f"error  {src}: PermissionError: [Errno 13] Access is denied: {str(dst)!r}\n"
+        return f"error  {src}: IsADirectoryError: [Errno 21] Is a directory: {str(dst)!r}\n"
+
     def test_destination_is_a_directory(self):
         p = self.png(self.dir / "x.png")
         dst = self.dir / "x.clean.png"
         dst.mkdir()
         rc, out, err = run("-f", p)
         self.assertEqual(rc, 1, out + err)
-        self.assertEqual(err, f"error  {p}: IsADirectoryError: [Errno 21] Is a directory: '{dst}'\n")
+        self.assertEqual(err, self.is_a_directory(p, dst))
         # the same through -o with a relative path
         cwd = os.getcwd()
         os.chdir(self.dir)
@@ -248,10 +254,10 @@ class DestinationErrors(Base):
         finally:
             os.chdir(cwd)
         self.assertEqual(rc, 1, out + err)
-        self.assertEqual(err, f"error  x.png: IsADirectoryError: [Errno 21] Is a directory: '{Path('o') / 'x.png'}'\n")
+        self.assertEqual(err, self.is_a_directory("x.png", Path("o") / "x.png"))
         self.assertEqual([f.name for f in self.dir.iterdir() if f.name.startswith(".metawipe-")], [])
 
-    @unittest.skipIf(os.geteuid() == 0, "root ignores permissions")
+    @unittest.skipIf(os.name == "nt" or os.geteuid() == 0, "root (and Windows) ignore these permission bits")
     def test_unwritable_directory(self):
         ro = self.dir / "ro"
         ro.mkdir()
@@ -274,15 +280,16 @@ class DestinationErrors(Base):
                 raise make(dst)
             return handler
 
+        clean, p_, other_ = (repr(str(x)) for x in (self.dir / "x.clean.png", p, other))  # repr: Windows doubles \\
         cases = [
             (lambda dst: OSError(18, "Invalid cross-device link", str(dst), None, str(other)),
-             f"OSError: [Errno 18] Invalid cross-device link: '{self.dir / 'x.clean.png'}' -> '{other}'"),
+             f"OSError: [Errno 18] Invalid cross-device link: {clean} -> {other_}"),
             (lambda dst: OSError(18, "Invalid cross-device link", str(p), None, str(dst)),
-             f"OSError: [Errno 18] Invalid cross-device link: '{p}' -> '{self.dir / 'x.clean.png'}'"),
+             f"OSError: [Errno 18] Invalid cross-device link: {p_} -> {clean}"),
             (lambda dst: PermissionError(13, "Permission denied", str(dst), None, str(dst)),
-             f"PermissionError: [Errno 13] Permission denied: '{self.dir / 'x.clean.png'}'"),
+             f"PermissionError: [Errno 13] Permission denied: {clean}"),
             (lambda dst: PermissionError(13, "Permission denied", os.path.realpath(dst)),
-             f"PermissionError: [Errno 13] Permission denied: '{self.dir / 'x.clean.png'}'"),
+             f"PermissionError: [Errno 13] Permission denied: {clean}"),
         ]
         for make, expected in cases:
             with self.subTest(expected), mock.patch.dict(cli.HANDLERS, {".png": raising(make)}):

@@ -115,7 +115,7 @@ class TuiDesignTests(unittest.TestCase):
 
     def test_run_button_says_what_will_happen_and_outcome_shows_in_tree(self):
         with tempfile.TemporaryDirectory() as tmp:
-            p = Path(tmp) / "a.png"
+            p = Path(tmp).resolve() / "a.png"  # the tree shows resolved paths (macOS: /var -> /private/var)
             p.write_bytes(png_bytes([(b"tEXt", b"k\x00" + SECRET)]))
             (Path(tmp) / "notes.txt").write_text("hi")
 

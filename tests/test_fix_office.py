@@ -4,6 +4,7 @@ Packages are assembled byte for byte here; results are read back with unzip/ET/f
 code that produced them wherever those are installed.
 """
 import io
+import os
 import re
 import shutil
 import subprocess
@@ -382,6 +383,7 @@ class F12PartNames(Fix):
             self.assertEqual(self.names(p), ["[Content_Types].xml", "_rels/.rels", "word/document.xml"], name)
             self.assertZipIntact(p)
 
+    @unittest.skipIf(os.sep == "\\", "zipfile turns \\ in entry names into / on Windows: the fixture cannot be built")
     def test_f12_backslash_entry_names(self):
         entries = [("[Content_Types].xml", CT % '<Override PartName="/docProps/core.xml" ContentType="c"/>'),
                    ("_rels\\.rels", rels(("r1", "officeDocument", "word/document.xml"),
