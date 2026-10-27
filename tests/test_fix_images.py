@@ -490,7 +490,7 @@ class HeifNames(Base):
     def synthetic(self):
         hdlr = isobmff_box(b"hdlr", b"\x00" * 4 + b"\x00" * 4 + b"pict" + b"\x00" * 12 + b"SECRET-HANDLER-NAME\x00")
         infe1 = isobmff_box(b"infe", b"\x02\x00\x00\x00" + struct.pack(">HH", 1, 0) + b"hvc1" + b"SECRET-ITEMNAME-primary\x00")
-        infe2 = isobmff_box(b"infe", b"\x02\x00\x00\x00" + struct.pack(">HH", 2, 0) + b"mime" + b"SECRET-MIMENAME\x00image/x-keep\x00")
+        infe2 = isobmff_box(b"infe", b"\x02\x00\x00\x00" + struct.pack(">HH", 2, 0) + b"uri " + b"SECRET-MIMENAME\x00urn:x-keep\x00")
         infe3 = isobmff_box(b"infe", b"\x00\x00\x00\x00" + struct.pack(">HH", 3, 0) + b"SECRET-V0NAME\x00image/jpeg\x00")
         iinf = isobmff_box(b"iinf", b"\x00\x00\x00\x00" + struct.pack(">H", 3) + infe1 + infe2 + infe3)
         meta = isobmff_box(b"meta", b"\x00\x00\x00\x00" + hdlr + iinf)
@@ -503,7 +503,7 @@ class HeifNames(Base):
         for needle in (b"SECRET-HANDLER", b"SECRET-ITEMNAME", b"SECRET-MIMENAME", b"SECRET-V0NAME"):
             self.assertIn(needle, d)
             self.assertNotIn(needle, out)
-        self.assertIn(b"image/x-keep\x00", out)  # strings after the name stay where they were
+        self.assertIn(b"urn:x-keep\x00", out)  # strings after the name stay where they were
         self.assertIn(b"image/jpeg\x00", out)
         self.assertIn(b"hvc1", out)
 

@@ -642,7 +642,8 @@ class CliTests(Base):
         self.assertEqual(rc, 0, err)
         self.assertTrue((self.dir / "my.clean.clean.png").exists())
         rc, out, err = run(self.dir)  # second run: *.clean.* with an existing source are outputs
-        self.assertIn("skipped", out)
+        self.assertIn("1 skipped", out)
+        self.assertFalse((self.dir / "my.clean.clean.clean.png").exists())
 
     def test_lock_files_ignored_and_duplicates_cleaned_once(self):
         self.png(self.dir / "a.png")

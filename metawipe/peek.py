@@ -11,10 +11,10 @@ import re
 import shutil
 import subprocess
 import zipfile
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
-from . import images, isobmff, office, video
+from . import dump, images, isobmff, office, video
+from .common import WipeError
 
 _EXIF_NAMES = {
     270: "ImageDescription", 271: "Make", 272: "Model", 305: "Software", 306: "DateTime", 315: "Artist",
@@ -25,6 +25,9 @@ _EXIF_NAMES = {
 }
 _SIZES = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8}
 _XMP_ID = b"http://ns.adobe.com/xap/1.0/\x00"
+_READ_CAP = 256 << 20  # largest file read into memory
+_PART_CAP = 8 << 20  # largest zip member read
+_SEGMENT_CAP = 1000  # real JPEGs have a few dozen segments outside their scans
 
 
 def _tiff_fields(tiff: bytes) -> list[tuple[str, str]]:
@@ -55,12 +58,18 @@ def _tiff_fields(tiff: bytes) -> list[tuple[str, str]]:
             vals.append(num / den if den else 0.0)
         return vals
 
+    seen = set()  # IFDs that point at each other must not be read over and over
+
     def walk(ifd, depth=0):
+        if ifd in seen:
+            return
+        seen.add(ifd)
         gps = {}
         for tag, typ, cnt, off, size in entries(ifd):
             if tag in (34665, 40965) and depth < 3:
                 walk(u(off, 4), depth + 1)
-            elif tag == 34853 and depth < 3:
+            elif tag == 34853 and depth < 3 and u(off, 4) not in seen:
+                seen.add(u(off, 4))
                 for t2, ty2, c2, o2, s2 in entries(u(off, 4)):
                     gps[t2] = (ty2, c2, o2, s2)
             elif tag == 37500:
@@ -103,29 +112,28 @@ def _xmp_fields(xmp: bytes) -> list[tuple[str, str]]:
 
 def _jpeg(data: bytes) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
-    i, n = 2, len(data)
-    while i + 4 <= n and data[i] == 0xFF:
-        marker = data[i + 1]
-        if marker == 0xDA or marker == 0xD9:
-            break
-        length = int.from_bytes(data[i + 2:i + 4], "big")
-        payload = data[i + 4:i + 2 + length]
-        if marker == 0xE1 and payload[:6] == b"Exif\x00\x00":
-            out += _tiff_fields(payload[6:])
-        elif marker == 0xE1 and payload.startswith(_XMP_ID):
-            out += _xmp_fields(payload[len(_XMP_ID):])
-        elif marker == 0xED:
-            out.append(("Photoshop/IPTC", f"{len(payload)} bytes"))
-        elif marker == 0xFE:
-            out.append(("Comment", payload.decode("utf-8", "replace")[:80]))
-        elif marker == 0xE2 and payload[:4] == b"MPF\x00":
-            out.append(("MPF (extra images)", f"{len(payload)} bytes"))
-        elif marker == 0xE0 and payload[:5] == b"JFIF\x00" and len(payload) > 14 and (payload[12] or payload[13]):
-            out.append(("JFIF thumbnail", f"{payload[12]}x{payload[13]}"))
-        i += 2 + length
-    end = data.rfind(b"\xff\xd9")
-    if 0 < end < n - 2:
-        out.append(("Data after end of image", f"{n - end - 2} bytes"))
+    try:
+        for count, (marker, start, end) in enumerate(images.jpeg_segments(data)):
+            if count == _SEGMENT_CAP:
+                out.append(("Not fully inspected", f"more than {_SEGMENT_CAP} JPEG segments"))
+                break
+            payload = data[start + 4:end] if 0xE0 <= marker <= 0xEF or marker == 0xFE else b""
+            if marker == 0xE1 and payload[:6] == b"Exif\x00\x00":
+                out += _tiff_fields(payload[6:])
+            elif marker == 0xE1 and payload.startswith(_XMP_ID):
+                out += _xmp_fields(payload[len(_XMP_ID):])
+            elif marker == 0xED:
+                out.append(("Photoshop/IPTC", f"{len(payload)} bytes"))
+            elif marker == 0xFE:
+                out.append(("Comment", payload.decode("utf-8", "replace")[:80]))
+            elif marker == 0xE2 and payload[:4] == b"MPF\x00":
+                out.append(("MPF (extra images)", f"{len(payload)} bytes"))
+            elif marker == 0xE0 and payload[:5] == b"JFIF\x00" and len(payload) > 14 and (payload[12] or payload[13]):
+                out.append(("JFIF thumbnail", f"{payload[12]}x{payload[13]}"))
+            elif marker == 0xD9 and end < len(data):
+                out.append(("Data after end of image", f"{len(data) - end} bytes"))
+    except WipeError:
+        pass  # damaged JPEG: keep what was found before the damage
     return out
 
 
@@ -166,10 +174,15 @@ def _heif(data: bytes) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
     buf = bytearray(data)
     try:
+        isobmff._refuse_stray_items(buf, 0, len(buf), top=True)  # the cleaner refuses these files too
         for btype, _, pp, be in isobmff._boxes(buf, 0, len(buf)):
             if btype != b"meta":
                 continue
-            children = {c[0]: c for c in isobmff._boxes(buf, pp + 4, be)}
+            children = list(isobmff._boxes(buf, pp + 4, be))
+            for name in (b"iinf", b"iloc", b"idat"):  # the cleaner refuses these files too
+                if sum(c[0] == name for c in children) > 1:
+                    raise WipeError(f"more than one {name.decode()} box in meta")
+            children = {c[0]: c for c in children}
             if b"iinf" not in children or b"iloc" not in children:
                 continue
             _, _, ip, ie = children[b"iinf"]
@@ -177,7 +190,9 @@ def _heif(data: bytes) -> list[tuple[str, str]]:
             wanted = {}
             for bt, _, p2, b2 in isobmff._boxes(buf, first, ie):
                 info = isobmff._parse_infe(buf, p2, b2) if bt == b"infe" else None
-                if info and (info[1] == b"Exif" or (info[1] == b"mime" and b"rdf+xml" in bytes(buf[info[3]:b2]))):
+                if not info:
+                    continue
+                if info[1] in (b"Exif", b"mime"):  # exiv2 shows every mime item as XMP
                     wanted[info[0]] = info[1]
             _, _, lp, le = children[b"iloc"]
             idat = children.get(b"idat")
@@ -227,13 +242,22 @@ def _package(path: Path) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
     with zipfile.ZipFile(path) as z:
         names = z.namelist()
+        left = _READ_CAP  # for all members together, or many big parts take minutes
+
+        def read(name, cap=_PART_CAP):
+            nonlocal left
+            with z.open(name) as f:
+                data = f.read(min(cap, left))
+            left -= len(data)
+            return data
 
         def text(name):
-            return z.read(name).decode("utf-8", "replace")
+            return read(name).decode("utf-8", "replace")
 
         if "meta.xml" in names:  # OpenDocument
+            meta = text("meta.xml")
             for tag in ("initial-creator", "creator", "creation-date", "date", "generator", "user-defined"):
-                for m in re.finditer(rf"<(?:meta|dc):{tag}[^>]*>([^<]+)<", text("meta.xml")):
+                for m in re.finditer(rf"<(?:meta|dc):{tag}[^>]*>([^<]+)<", meta):
                     out.append((tag, m.group(1)[:80]))
             for name in names:
                 if name.startswith("Thumbnails/") and not name.endswith("/"):
@@ -246,12 +270,12 @@ def _package(path: Path) -> list[tuple[str, str]]:
                 creators = set(re.findall(r"<dc:creator>([^<]+)<", text("content.xml"))) - {"Author"}
                 if creators:
                     out.append(("Comment/revision authors", ", ".join(sorted(creators))[:80]))
-            return out
         for name, fields in (("docProps/core.xml", ("creator", "lastModifiedBy", "created", "modified", "title", "subject", "keywords")),
                              ("docProps/app.xml", ("Company", "Manager", "Application", "TotalTime"))):
             if name in names:
+                xml = text(name)
                 for field in fields:
-                    m = re.search(rf"<(?:\w+:)?{field}\b[^>]*>([^<]+)<", text(name))
+                    m = re.search(rf"<(?:\w+:)?{field}\b[^>]*>([^<]+)<", xml)
                     if m and m.group(1).strip():
                         out.append((field, m.group(1).strip()[:80]))
         if "docProps/custom.xml" in names:
@@ -280,10 +304,12 @@ def _package(path: Path) -> list[tuple[str, str]]:
                 out.append(("Digital signature", name))
         for name in names:
             ext = posixpath.splitext(name)[1].lower()
-            if any(m in "/" + name for m in ("/media/",)) and ext in images.BY_EXT:
-                found = _by_extension(z.read(name), ext)
+            if any(m in "/" + name.lower() for m in office._MEDIA_DIRS) and ext in images.BY_EXT:
+                found = _by_extension(read(name, 32 << 20), ext)
                 if found:
                     out.append((f"Embedded picture {posixpath.basename(name)}", ", ".join(f"{k}" for k, _ in found)[:80]))
+        if left <= 0:
+            out.append(("Not fully inspected", f"parts over {_READ_CAP >> 20} MB unpacked"))
     return out
 
 
@@ -303,7 +329,7 @@ def _video(path: Path) -> list[tuple[str, str]]:
         return [("ffprobe", "not installed - cannot inspect")]
     proc = subprocess.run(
         [ffprobe, "-v", "error", "-protocol_whitelist", "file", "-f", "mov", "-print_format", "json", "-show_format",
-         "-show_streams", "-i", video._file_url(path)], capture_output=True, text=True)
+         "-show_streams", "-i", video._file_url(path)], capture_output=True, text=True, timeout=60)
     try:
         info = json.loads(proc.stdout)
     except ValueError:
@@ -324,20 +350,32 @@ def _video(path: Path) -> list[tuple[str, str]]:
     return out
 
 
+def _read(path: Path) -> bytes:
+    with path.open("rb") as f:
+        return f.read(_READ_CAP)
+
+
 def inspect_file(path: Path) -> list[tuple[str, str]]:
     """Identifying metadata found in `path` (best effort)."""
+    if not path.is_file():  # a FIFO would block, a device would never end
+        return [("could not inspect", "not a regular file")]
+    # values are raw file text that reaches the terminal: strip control characters
+    return [(dump._clip(k), dump._clip(v)) for k, v in _inspect(path)]
+
+
+def _inspect(path: Path) -> list[tuple[str, str]]:
     ext = path.suffix.lower()
     try:
         if ext in (".jpg", ".jpeg", ".jpe"):
-            return _jpeg(path.read_bytes())
+            return _jpeg(_read(path))
         if ext in (".png", ".apng"):
-            return _png(path.read_bytes())
+            return _png(_read(path))
         if ext == ".webp":
-            return _webp(path.read_bytes())
+            return _webp(_read(path))
         if ext in (".tif", ".tiff"):
-            return _tiff_fields(path.read_bytes())
+            return _tiff_fields(_read(path))
         if ext in (".heic", ".heif", ".avif"):
-            return _heif(path.read_bytes())
+            return _heif(_read(path))
         if ext == ".pdf":
             return _pdf(path)
         if ext in office.OOXML_EXT | office.ODF_EXT:

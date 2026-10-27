@@ -24,6 +24,26 @@ class Context:
         self.warn(msg)
 
 
+def boxes(buf, start: int, end: int):
+    """Yield (type, box_start, payload_start, box_end) for the ISO-BMFF boxes in buf[start:end]."""
+    pos = start
+    while pos + 8 <= end:
+        size = struct.unpack_from(">I", buf, pos)[0]
+        btype = bytes(buf[pos + 4:pos + 8])
+        header = 8
+        if size == 1:
+            if pos + 16 > end:
+                raise WipeError("corrupt file: truncated box header")
+            size = struct.unpack_from(">Q", buf, pos + 8)[0]
+            header = 16
+        elif size == 0:
+            size = end - pos
+        if size < header or pos + size > end:
+            raise WipeError("corrupt file: bad box size")
+        yield btype, pos, pos + header, pos + size
+        pos += size
+
+
 # Orientation is not identifying and dropping it would turn portrait photos sideways, so image
 # handlers keep a single-tag Exif block carrying only this value.
 def minimal_tiff(orientation: int) -> bytes:

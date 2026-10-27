@@ -5,7 +5,7 @@ Command-line tool that strips identifying metadata from files before you share t
 | Type | Extensions | How |
 |------|-----------|-----|
 | Photos | `jpg jpeg png apng webp tif tiff` | Container-level: pixels are copied byte for byte (no re-encoding), only structural parts are kept |
-| iPhone/HEIF | `heic heif avif` | Exif/XMP payloads zeroed in place, file size and image data unchanged |
+| iPhone/HEIF | `heic heif avif` | Exif payloads and every mime item (XMP, whatever its content type) zeroed in place, file size and image data unchanged |
 | Video | `mov mp4 m4v 3gp` | `ffmpeg -c copy`: no re-encode; location, device, creation time, metadata tracks and cover art dropped; track languages kept |
 | PDF | `pdf` | pypdf: Info dictionary, XMP, `/PieceInfo`, thumbnails, file `/ID`, pdfTeX paths, signature identities (incl. signer certificates in `/DSS`); outlines, forms (field names too), layers survive |
 | Office | `docx xlsx pptx` (+ macro/template variants) | properties, thumbnail, people list, template path, absolute path, printer settings; nested packages cleaned wherever they sit in the package |
@@ -22,6 +22,7 @@ pip install .            # puts a `metawipe` command in the venv; or use  python
 Videos need `ffmpeg` (with `ffprobe`) on the PATH (`brew install ffmpeg`, `pacman -S ffmpeg`, ...);
 `--full` on a video refuses to run without `ffprobe`. Everything else is pure Python.
 For the interactive TUI (`metawipe --tui`) install with `pip install '.[tui]'`.
+In the TUI, `v` switches the preview between what the file reveals and everything it carries.
 
 ## Usage
 
@@ -30,6 +31,7 @@ metawipe photo.jpg report.pdf          # writes photo.clean.jpg and report.clean
 metawipe -i -r ~/Pictures/trip         # overwrite originals, recursively
 metawipe -r -o cleaned/ ~/Documents    # cleaned copies in cleaned/, same folder structure
 metawipe -p secret locked.pdf          # password for encrypted PDFs
+metawipe --show photo.jpg              # list everything the file carries, writes nothing (-r for folders)
 ```
 
 - Existing output files are never overwritten unless you pass `-f`.
@@ -87,11 +89,22 @@ change time (ctime) is set by the OS and cannot be altered.
 ## Refused or reported instead of cleaned
 
 - Encrypted OpenDocument files and HEIF files in the compact `mini` layout (`mif3`) are refused.
+- HEIF/AVIF files whose structure could hide an Exif/XMP item from the cleaner are refused and nothing is written: more than one `iinf`, `iloc` or `idat` in `meta`;
+  `iinf`/`infe`/`iloc` boxes outside their place in the top-level `meta`; an `infe` above version 3, version 3 with a version 2 layout, or truncated;
+  an `iloc` that overruns its box, has zero-size length fields or extents longer than the file; an `mvhd`/`tkhd`/`mdhd` too short for its version.
 - Truncated or damaged videos (including truncated fragmented MP4) fail instead of producing a partial copy; damaged TIFFs (strips past the end
   of the file, overlapping structures) fail instead of being zero-padded.
 - Dolby Vision signalling cannot be written into `.mov` by ffmpeg (a warning says so); `.mp4`/`.m4v` keep it.
 - Warnings are printed for OLE embeddings, `customXml` (dropped by `--full`) and PDF pages that are no
   longer in the page tree but still referenced by bookmarks or links.
+
+## Limits of the preview and `--show`
+
+They only limit what is displayed; the cleaners read whole files. The preview and the "still carries" check read at most 256 MB of a file,
+8 MB per XML part and 32 MB per embedded picture, and 256 MB in total per package (`--show` stops at 256 MB decompressed and says so).
+A JPEG with more than 1000 segments is cut ("Not fully inspected"). A JPEG cut inside a segment still shows what that segment holds plus a
+"truncated JPEG segment" row, but the cleaner refuses it. Control and bidi-override characters in file text are shown as spaces.
+"Not fully inspected" means that no finding is not proof.
 
 ## What is never touched
 

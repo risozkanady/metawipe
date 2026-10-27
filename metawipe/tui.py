@@ -5,6 +5,7 @@ import argparse
 import os
 from pathlib import Path
 
+from rich.markup import escape
 from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
@@ -113,6 +114,7 @@ HELP = """[b]metawipe[/b] - removes identifying metadata (location, device, auth
   up/down, Enter  move, open/close folders        m or space  mark / unmark file or folder (folders: recursive)
   a  mark all supported files in this folder      c  clear all marks
   r  clean everything marked (marks clear)        f  toggle full scrub
+  v  preview: switch between "what it reveals" and [b]everything[/b] the file carries (scrolls; sections in blue)
   F1 or ?  this help                              q  quit            Tab  jump between tree and options
 
 [b]Options[/b]
@@ -154,17 +156,19 @@ class HelpScreen(ModalScreen[None]):
 class TuiReport(cli.Report):
     """cli.Report that reports into the log widget instead of stderr."""
 
-    def __init__(self, emit):
+    def __init__(self, emit, failed=lambda path: None):
         super().__init__(verbose=True)
         self.emit = emit
+        self.mark_failed = failed
 
     def fail(self, path, msg: str) -> None:
         self.failed += 1
-        self.emit(f"[red]error[/]  {path}: {msg}")
+        self.mark_failed(Path(path))
+        self.emit(f"[red]error[/]  {escape(str(path))}: {escape(msg)}")
 
     def skip(self, path, why: str) -> None:
         self.skipped += 1
-        self.emit(f"[dim]skip   {path} ({why})[/]")
+        self.emit(f"[dim]skip   {escape(str(path))} ({escape(why)})[/]")
 
 
 class MetawipeApp(App):
@@ -190,6 +194,7 @@ class MetawipeApp(App):
         Binding("c", "clear_marks", "Clear marks"),
         Binding("r", "run", "Run"),
         Binding("f", "toggle_full", "Full scrub"),
+        Binding("v", "toggle_view", "Everything"),
         Binding("f1,question_mark", "help", "Help"),
         Binding("q", "quit", "Quit"),
     ]
@@ -199,6 +204,7 @@ class MetawipeApp(App):
         self.start = Path(start or Path.cwd())
         self.marks: set[Path] = set()
         self.highlighted: Path | None = None
+        self.view_all = False  # preview: what the file reveals (summary) or every metadata entry it carries
         self.states: dict[Path, str] = {}  # outcome of the last run per file: done / incomplete / failed
 
     def compose(self) -> ComposeResult:
@@ -228,7 +234,7 @@ class MetawipeApp(App):
     def on_mount(self) -> None:
         self.register_theme(THEME)
         self.theme = "metawipe"
-        self.query_one("#left").border_title = str(self.start)
+        self.query_one("#left").border_title = Text(str(self.start))
         table = self.query_one("#preview", DataTable)
         table.add_column("found", width=26)
         table.add_column("value")
@@ -283,7 +289,7 @@ class MetawipeApp(App):
         if path is None:
             return
         if not path.is_dir() and cli.HANDLERS.get(path.suffix.lower()) is None:
-            self.notify(f"metawipe cannot clean {path.suffix or 'this'} files.", severity="warning")
+            self.notify(f"metawipe cannot clean {path.suffix or 'this'} files.", severity="warning", markup=False)
             return
         self.marks.symmetric_difference_update({path})
         self._marks_changed()
@@ -294,7 +300,7 @@ class MetawipeApp(App):
         found = [p for p in sorted(folder.iterdir()) if p.is_file() and cli.HANDLERS.get(p.suffix.lower())]
         self.marks.update(found)
         self._marks_changed()
-        self.log_line(f"marked {len(found)} supported file(s) in {folder}")
+        self.log_line(f"marked {len(found)} supported file(s) in {escape(str(folder))}")
 
     def action_clear_marks(self) -> None:
         self.marks.clear()
@@ -302,6 +308,11 @@ class MetawipeApp(App):
 
     def action_help(self) -> None:
         self.push_screen(HelpScreen())
+
+    def action_toggle_view(self) -> None:
+        self.view_all = not self.view_all
+        if self.highlighted is not None:
+            self.preview(self.highlighted)
 
     def action_toggle_full(self) -> None:
         sw = self.query_one("#full", Switch)
@@ -318,19 +329,39 @@ class MetawipeApp(App):
 
     @work(thread=True, exclusive=True, group="preview")
     def preview(self, path: Path) -> None:
+        everything = self.view_all
         if path.is_dir():
-            rows = [("Folder", f"{sum(1 for p in path.iterdir() if p.is_file() and cli.HANDLERS.get(p.suffix.lower()))} supported file(s)")]
+            # direct children only: a recursive walk per highlight piles up on big trees (the run dialog counts them all)
+            rows = [("Folder", f"{sum(1 for p in path.iterdir() if p.is_file() and cli.HANDLERS.get(p.suffix.lower()))} supported file(s) directly inside")]
+            everything = False
+        elif everything:
+            from . import dump
+            rows = dump.dump_file(path)
         else:
             rows = peek.inspect_file(path) or [("Nothing identifying found", "")]
-        self.call_from_thread(self._show_preview, path, rows)
+        self.call_from_thread(self._show_preview, path, rows, everything)
 
-    def _show_preview(self, path: Path, rows) -> None:
+    def _show_preview(self, path: Path, rows, everything: bool = False) -> None:
+        if path != self.highlighted or (everything != self.view_all and not path.is_dir()):
+            return  # a slow preview finished after the cursor moved on or v switched the view
         table = self.query_one("#preview", DataTable)
         table.clear()
-        table.border_title = path.name
+        table.border_title = Text(f"{path.name} - everything it carries" if everything else path.name)
+        hint = "v: summary" if everything else "v: everything"
         if path.is_dir():
             table.add_row(Text("▸ Folder", style="bold"), rows[0][1])
             table.border_subtitle = "space marks it with everything inside"
+            return
+        if everything:
+            section = None
+            for sec, name, value in rows:
+                if sec != section:
+                    section = sec
+                    table.add_row(Text(sec, style=f"bold {STEEL}"), "")
+                table.add_row(Text.assemble(("● ", _SEVERITY_STYLE[severity(name)]), name), Text(value))
+            sensitive = sum(1 for _, name, _ in rows if severity(name) == 0)
+            table.border_subtitle = f"{len(rows)} entries, {sensitive} sensitive   {hint}"
+            table.scroll_home(animate=False)
             return
         if rows and rows[0][0] == "unsupported":
             table.add_row(Text("– Not supported", style=MUTED), "metawipe cannot clean this file type")
@@ -338,13 +369,13 @@ class MetawipeApp(App):
             return
         if not rows or rows[0][0] == "Nothing identifying found":
             table.add_row(Text("✓ Nothing found", style=f"bold {SEA}"), "no identifying metadata in this file")
-            table.border_subtitle = ""
+            table.border_subtitle = hint
             return
         ranked = sorted(rows, key=lambda r: severity(r[0]))
         for key, value in ranked:
-            table.add_row(Text.assemble(("● ", _SEVERITY_STYLE[severity(key)]), key), value)
+            table.add_row(Text.assemble(("● ", _SEVERITY_STYLE[severity(key)]), key), Text(value))
         sensitive = sum(1 for k, _ in rows if severity(k) == 0)
-        table.border_subtitle = f"{sensitive} sensitive, {len(rows) - sensitive} other" if sensitive else f"{len(rows)} found"
+        table.border_subtitle = (f"{sensitive} sensitive, {len(rows) - sensitive} other" if sensitive else f"{len(rows)} found") + f"   {hint}"
 
     # ------------------------------------------------------------------ run
     @on(Button.Pressed, "#run")
@@ -359,12 +390,15 @@ class MetawipeApp(App):
             return None
         return argparse.Namespace(
             paths=[str(p) for p in sorted(self.marks)], recursive=True, in_place=mode == "inplace",
-            output_dir=Path(outdir).expanduser() if mode == "folder" else None,
+            output_dir=Path(os.path.expanduser(outdir)) if mode == "folder" else None,
             force=self.query_one("#force", Switch).value, password=None,
             full=self.query_one("#full", Switch).value, verbose=True,
         )
 
     def action_run(self) -> None:
+        if any(w.group == "run" and not w.is_finished for w in self.workers):
+            self.notify("Still cleaning: wait for the current run to finish.", severity="warning")
+            return
         if not self.marks:
             self.notify("Nothing marked: press space on files or folders.", severity="warning")
             return
@@ -372,28 +406,31 @@ class MetawipeApp(App):
         if args is None:
             return
         if args.in_place:
-            self.push_screen(Confirm(f"Overwrite {len(self.marks)} marked item(s) in place?\nThe originals cannot be recovered."),
-                             lambda yes: self.start_run(args) if yes else self.log_line("[yellow]cancelled[/]"))
+            self.confirm_in_place(args)
         else:
             self.start_run(args)
+
+    @work(thread=True, group="run")  # planning a big tree takes seconds; in group "run" so r cannot start a second one
+    def confirm_in_place(self, args: argparse.Namespace) -> None:
+        n = len(cli.plan(args, TuiReport(lambda text: None)))  # count what will really be overwritten, hidden files included
+        self.call_from_thread(lambda: self.push_screen(Confirm(f"Overwrite {n} file(s) in place?\nThe originals cannot be recovered."),
+                              lambda yes: self.start_run(args) if yes else self.log_line("[yellow]cancelled[/]")))
 
     @work(thread=True, exclusive=True, group="run")
     def start_run(self, args: argparse.Namespace) -> None:
         emit = lambda text: self.call_from_thread(self.log_line, text)  # noqa: E731
-        report = TuiReport(emit)
+        report = TuiReport(emit, lambda path: self.call_from_thread(self.states.__setitem__, path, "failed"))
         emit(f"[b]cleaning[/] {len(args.paths)} item(s){' (full scrub)' if args.full else ''} ...")
         jobs = cli.plan(args, report)
         incomplete = 0
         for job in jobs:
             try:
-                ctx = cli.execute(job, args, warn=lambda msg, j=job: emit(f"[yellow]warn[/]   {j.src.name}: {msg}"))
+                ctx = cli.execute(job, args, warn=lambda msg, j=job: emit(f"[yellow]warn[/]   {escape(j.src.name)}: {escape(msg)}"))
             except WipeError as e:
                 report.fail(job.src, str(e))
-                self.call_from_thread(self.states.__setitem__, job.src, "failed")
                 continue
             except Exception as e:  # noqa: BLE001 - one bad file must not stop the batch
                 report.fail(job.src, f"{type(e).__name__}: {e}")
-                self.call_from_thread(self.states.__setitem__, job.src, "failed")
                 continue
             report.cleaned += 1
             left = peek.inspect_file(job.dst)
@@ -403,17 +440,17 @@ class MetawipeApp(App):
                 incomplete += 1
                 self.call_from_thread(self.states.__setitem__, job.src, "incomplete")
                 note = f" [yellow](INCOMPLETE: {len(ctx.residue)} item(s) left)[/]"
-            emit(f"[green]clean[/]  {self._short(job.src)} -> {'in place' if job.inplace else self._short(job.dst)}{note}")
+            emit(f"[green]clean[/]  {escape(self._short(job.src))} -> {'in place' if job.inplace else escape(self._short(job.dst))}{note}")
             if left:
-                emit("        still carries: " + ", ".join(f"{k}" for k, _ in left[:6]) + (" ..." if len(left) > 6 else ""))
+                emit("        still carries: " + ", ".join(escape(k) for k, _ in left[:6]) + (" ..." if len(left) > 6 else ""))
         emit(f"[b]done:[/] {report.cleaned} cleaned, {report.failed} failed, {report.skipped} skipped" + (f", {incomplete} incomplete" if args.full else ""))
-        self.call_from_thread(self._run_finished)
+        self.call_from_thread(self._run_finished, args)
         if self.highlighted is not None:
             self.call_from_thread(self.preview, self.highlighted)
 
 
-    def _run_finished(self) -> None:
-        self.marks.clear()  # the outcome now shows in the tree
+    def _run_finished(self, args: argparse.Namespace) -> None:
+        self.marks.difference_update(map(Path, args.paths))  # the outcome now shows in the tree; marks made during the run stay
         self._marks_changed()
 
 

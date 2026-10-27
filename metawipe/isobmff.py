@@ -1,48 +1,20 @@
 """Lossless metadata removal for HEIC/HEIF/AVIF (ISO base media file format).
 
 Removing boxes would shift the absolute offsets stored in `iloc`, so metadata is neutralised in
-place instead: Exif/XMP item payloads are overwritten with zeros, their item type is changed to
-the unknown type `free` (readers skip unknown item types) and stray xml/uuid/free boxes are
-blanked. Free-text name fields (handler names, compressor names, item names) are overwritten too.
-File size, offsets and the coded images stay exactly as they were.
+place instead: Exif and mime (XMP, whatever the content type says) item payloads are overwritten
+with zeros, their item type is changed to the unknown type `free` (readers skip unknown item types)
+and stray xml/uuid/free boxes are blanked. Free-text name fields (handler names, compressor names,
+item names) are overwritten too. File size, offsets and the coded images stay exactly as they were.
 """
 from __future__ import annotations
 
-import struct
 from pathlib import Path
 
 from .common import Context, WipeError
+from .common import boxes as _boxes
 
 _BLANK_BOXES = {b"xml ", b"bxml", b"uuid", b"free", b"skip"}
-_XMP_TYPES = (b"application/rdf+xml",)
 _VISUAL_HANDLERS = (b"vide", b"pict", b"auxv")
-
-
-def _boxes(buf: bytearray, start: int, end: int):
-    """Yield (type, box_start, payload_start, box_end) for the boxes in buf[start:end]."""
-    pos = start
-    while pos + 8 <= end:
-        size = struct.unpack_from(">I", buf, pos)[0]
-        btype = bytes(buf[pos + 4:pos + 8])
-        header = 8
-        if size == 1:
-            if pos + 16 > end:
-                raise WipeError("corrupt HEIF: truncated box header")
-            size = struct.unpack_from(">Q", buf, pos + 8)[0]
-            header = 16
-        elif size == 0:
-            size = end - pos
-        if size < header or pos + size > end:
-            raise WipeError("corrupt HEIF: bad box size")
-        yield btype, pos, pos + header, pos + size
-        pos += size
-
-
-def _cstr_end(buf: bytearray, pos: int, end: int) -> int:
-    k = buf.find(b"\x00", pos, end)
-    if k == -1:
-        raise WipeError("corrupt HEIF: unterminated string")
-    return k
 
 
 def _blank(buf: bytearray, start: int, end: int) -> None:
@@ -58,6 +30,10 @@ def _parse_infe(buf: bytearray, payload: int, end: int):
     version = buf[payload]
     if version < 2:
         return None
+    if version > 3:
+        raise WipeError("unsupported infe version")
+    if version == 3 and bytes(buf[payload + 8:payload + 12]) in (b"Exif", b"mime"):
+        raise WipeError("corrupt HEIF: infe version 3 with a version 2 layout")  # exiv2 ignores the version
     p = payload + 4
     if version == 2:
         item_id = _uint(buf, p, 2)
@@ -66,6 +42,8 @@ def _parse_infe(buf: bytearray, payload: int, end: int):
         item_id = _uint(buf, p, 4)
         p += 4
     p += 2  # protection index
+    if p + 4 > end:
+        raise WipeError("corrupt HEIF: truncated infe box")
     item_type = bytes(buf[p:p + 4])
     return item_id, item_type, p, p + 4
 
@@ -87,6 +65,7 @@ def _iloc_extents(buf: bytearray, payload: int, end: int, wanted: set[int]) -> d
         count = _uint(buf, p, 4)
         p += 4
     result: dict[int, list[tuple[int, int, int]]] = {}
+    total = 0
     for _ in range(count):
         if version < 2:
             item_id = _uint(buf, p, 2)
@@ -103,6 +82,8 @@ def _iloc_extents(buf: bytearray, payload: int, end: int, wanted: set[int]) -> d
         p += base_size
         extents = _uint(buf, p, 2)
         p += 2
+        if length_size == 0 or p + extents * (index_size + offset_size + length_size) > end:
+            raise WipeError("corrupt HEIF: iloc overruns its box")
         for _ in range(extents):
             p += index_size
             offset = _uint(buf, p, offset_size)
@@ -110,10 +91,28 @@ def _iloc_extents(buf: bytearray, payload: int, end: int, wanted: set[int]) -> d
             length = _uint(buf, p, length_size)
             p += length_size
             if item_id in wanted:
+                total += length
+                if total > len(buf):  # overlapping extents would be blanked over and over
+                    raise WipeError("corrupt HEIF: metadata extents exceed the file")
                 result.setdefault(item_id, []).append((method, base + offset, length))
-        if p > end:
-            raise WipeError("corrupt HEIF: iloc overruns its box")
     return result
+
+
+def _refuse_stray_items(buf: bytearray, start: int, end: int, allowed: tuple = (), top: bool = False) -> None:
+    """exiv2 reads iinf/infe/iloc in every meta, iprp, ipco, moov and iinf it meets; the cleaner only in a top-level
+    meta, so refuse them anywhere else (they could name Exif/XMP items that would never be blanked)."""
+    for btype, _, payload, box_end in _boxes(buf, start, end):
+        if btype in (b"iinf", b"infe", b"iloc") and btype not in allowed:
+            raise WipeError(f"corrupt HEIF: {btype.decode()} box outside its place in the top-level meta")
+        if btype == b"meta":
+            inner, payload = ((b"iinf", b"iloc") if top else ()), payload + 4
+        elif btype == b"iinf":
+            inner, payload = (b"infe",), payload + 4 + (2 if buf[payload:payload + 1] == b"\x00" else 4)
+        elif btype in (b"iprp", b"ipco", b"moov"):
+            inner = ()
+        else:
+            continue
+        _refuse_stray_items(buf, payload, box_end, inner)
 
 
 def _blank_hdlr_name(buf: bytearray, payload: int, end: int) -> None:
@@ -153,6 +152,8 @@ def _clean_moov(buf: bytearray, start: int, end: int, handler: bytes = b"") -> N
     compressor names, blank udta/meta."""
     for btype, box_start, payload, box_end in _boxes(buf, start, end):
         if btype in (b"mvhd", b"tkhd", b"mdhd"):
+            if box_end - payload < 12 or (buf[payload] == 1 and box_end - payload < 20):
+                raise WipeError(f"corrupt HEIF: truncated {btype.decode('latin-1')} box")
             _blank(buf, payload + 4, payload + (20 if buf[payload] == 1 else 12))
         elif btype in (b"udta", b"meta"):
             _blank(buf, payload, box_end)
@@ -177,6 +178,7 @@ def clean_heif(data: bytes) -> bytes:
         raise WipeError("HEIF 'mini' layout (brand mif3) is not supported")
     if b"meta" not in kinds and b"moov" not in kinds:
         raise WipeError("no meta or moov box found; cannot tell where the metadata is")
+    _refuse_stray_items(buf, 0, end, top=True)
     for btype, _, payload, box_end in top:
         if btype == b"moov":
             _clean_moov(buf, payload, box_end)
@@ -187,6 +189,9 @@ def clean_heif(data: bytes) -> bytes:
             buf[box_start + 4:box_start + 8] = b"free"
     for _, _, meta_payload, meta_end in metas:
         children = list(_boxes(buf, meta_payload + 4, meta_end))
+        for name in (b"iinf", b"iloc", b"idat"):
+            if sum(c[0] == name for c in children) > 1:
+                raise WipeError(f"corrupt HEIF: more than one {name.decode()} box in meta")
         by_type = {c[0]: c for c in children}
         unwanted: dict[int, tuple[int, int, int, int]] = {}
         if b"iinf" in by_type:
@@ -201,11 +206,10 @@ def clean_heif(data: bytes) -> bytes:
                         _blank_item_name(buf, pp + 8, be, True)
                     continue
                 item_id, item_type, type_pos, tail = info
-                is_xmp = item_type == b"mime" and any(t in bytes(buf[tail:be]) for t in _XMP_TYPES)
-                if item_type == b"Exif" or is_xmp:
+                if item_type in (b"Exif", b"mime"):  # exiv2 shows every mime item as XMP, whatever its content type
                     unwanted[item_id] = (type_pos, tail, be, item_id)
                 else:
-                    _blank_item_name(buf, tail, be, item_type in (b"mime", b"uri "))
+                    _blank_item_name(buf, tail, be, item_type == b"uri ")
         if unwanted:
             if b"iloc" not in by_type:
                 raise WipeError("corrupt HEIF: metadata items without iloc")

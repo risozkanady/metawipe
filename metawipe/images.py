@@ -18,17 +18,17 @@ from .common import Context, WipeError, minimal_tiff, tiff_orientation
 _EXIF_PREFIX = b"Exif\x00\x00"
 
 
-def clean_jpeg(data: bytes) -> bytes:
-    """Rebuild a JPEG keeping only JFIF (without thumbnail), ICC, Adobe and image segments.
+def jpeg_segments(data):
+    """Yield (marker, start, end) for each segment after the SOI, up to and including the first EOI.
 
-    Drops APP1 (Exif/XMP), APP13 (Photoshop/IPTC), MPF, COM and everything after the first EOI.
-    If the Exif block rotates the image, a block holding just the Orientation tag stays.
+    data[start:end] is the segment without fill bytes (data[start + 1] == marker); SOS includes its
+    entropy-coded data. Returns quietly when the data runs out; a scan running to the end yields end == len(data).
+    Raises WipeError on a missing SOI or a damaged segment, after yielding the segments before it (and the
+    segment itself, cut at the end of the data, when the data ends inside it).
     """
     n = len(data)
     if data[:2] != b"\xff\xd8":
         raise WipeError("not a JPEG (missing SOI)")
-    out = [b"\xff\xd8"]
-    exif_done = False
     i = 2
     while i < n:
         if data[i] != 0xFF:
@@ -36,23 +36,23 @@ def clean_jpeg(data: bytes) -> bytes:
         while i < n and data[i] == 0xFF:
             i += 1
         if i >= n:
-            break
+            return
         marker = data[i]
         i += 1
-        if marker == 0xD9:
-            out.append(b"\xff\xd9")
-            return b"".join(out)
-        if marker == 0x01 or 0xD0 <= marker <= 0xD8:
-            out.append(bytes([0xFF, marker]))
+        if marker == 0x01 or 0xD0 <= marker <= 0xD9:
+            yield marker, i - 2, i
+            if marker == 0xD9:
+                return
             continue
         if i + 2 > n:
             raise WipeError("truncated JPEG segment header")
         length = int.from_bytes(data[i:i + 2], "big")
         end = i + length
         if length < 2 or end > n:
+            if length >= 2:
+                yield marker, i - 2, n  # readers keep what the cut segment still holds; the cleaner stops below
             raise WipeError("truncated JPEG segment")
-        payload = data[i + 2:end]
-        if marker == 0xDA:  # SOS: header plus entropy-coded data, copied verbatim
+        if marker == 0xDA:  # SOS: the entropy-coded data runs to the next real marker
             j = end
             while True:
                 k = data.find(b"\xff", j)
@@ -66,13 +66,22 @@ def clean_jpeg(data: bytes) -> bytes:
                     j = k + 1
                 else:
                     break
-            out.append(data[i - 2:k])
-            if k >= n:  # file lacks an EOI; add one
-                out.append(b"\xff\xd9")
-                return b"".join(out)
-            i = k
-            continue
-        seg = bytes([0xFF, marker]) + data[i:end]
+            end = k
+        yield marker, i - 2, end
+        i = end
+
+
+def clean_jpeg(data: bytes) -> bytes:
+    """Rebuild a JPEG keeping only JFIF (without thumbnail), ICC, Adobe and image segments.
+
+    Drops APP1 (Exif/XMP), APP13 (Photoshop/IPTC), MPF, COM and everything after the first EOI.
+    If the Exif block rotates the image, a block holding just the Orientation tag stays.
+    """
+    out = [b"\xff\xd8"]
+    exif_done = False
+    marker = None
+    for marker, start, end in jpeg_segments(data):
+        payload = data[start + 4:end] if 0xE0 <= marker <= 0xEF else b""
         if marker == 0xE0:
             if payload[:5] == b"JFIF\x00" and len(payload) >= 14:
                 out.append(b"\xff\xe0\x00\x10" + payload[:12] + b"\x00\x00")  # thumbnail removed
@@ -85,16 +94,19 @@ def clean_jpeg(data: bytes) -> bytes:
                     out.append(b"\xff\xe1" + struct.pack(">H", len(block) + 2) + block)
         elif marker == 0xE2:
             if payload[:12] == b"ICC_PROFILE\x00":
-                out.append(seg)
+                out.append(data[start:end])
         elif marker == 0xEE:
             if payload[:5] == b"Adobe":
-                out.append(seg)
+                out.append(data[start:end])
         elif 0xE3 <= marker <= 0xEF or marker == 0xFE:
             pass
         else:
-            out.append(seg)
-        i = end
-    raise WipeError("corrupt JPEG: no EOI/scan found")
+            out.append(data[start:end])
+    if marker == 0xDA:  # file lacks an EOI; add one
+        out.append(b"\xff\xd9")
+    elif marker != 0xD9:
+        raise WipeError("corrupt JPEG: no EOI/scan found")
+    return b"".join(out)
 
 
 # ---------------------------------------------------------------- PNG

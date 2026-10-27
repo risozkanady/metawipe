@@ -236,6 +236,7 @@ def _finish(tmp: Path, st: os.stat_result, inplace: bool, full: bool) -> None:
                 pass
         if full:
             os.utime(fd, (_FULL_MTIME, _FULL_MTIME))
+        os.fsync(fd)  # data on disk before the rename, or a power loss can leave an empty file in place of the original
     finally:
         os.close(fd)
 
@@ -316,11 +317,16 @@ def main(argv=None) -> int:
         "full scrub: also anonymise comment/revision authors and dates, clean pictures embedded in "
         "documents, drop customXml/printer settings, remove H.264/HEVC encoder strings (x264/x265 SEI), set mtime to 1980; "
         "exit status 2 if something identifying had to be left"))
+    ap.add_argument("--show", action="store_true", help="only list everything each file carries (writes nothing)")
     ap.add_argument("-v", "--verbose", action="store_true", help="also list skipped files")
     ap.add_argument("--version", action="version", version=f"metawipe {__version__}")
     args = ap.parse_args(argv)
     if args.in_place and args.output_dir:
         ap.error("--in-place and --output-dir are mutually exclusive")
+    if args.show:
+        if not args.paths:
+            ap.error("--show needs files")
+        return _show(args)
     if args.tui or (not args.paths and sys.stdin.isatty() and sys.stdout.isatty()):
         try:
             from . import tui
@@ -343,6 +349,35 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         return 130
+
+
+def _show(args) -> int:
+    """Read-only listing of every metadata entry of the given files (directories: supported files inside, -r recurses)."""
+    from . import dump
+    files, status = [], 0
+    for arg in args.paths:
+        p = Path(arg)
+        if p.is_dir():
+            found = p.rglob("*") if args.recursive else p.iterdir()
+            files += sorted(f for f in found if f.is_file() and not _is_transient(f.name) and not any(x.startswith(".") for x in f.relative_to(p).parts)
+                            and _handler(f) is not None)
+        elif p.is_file():
+            files.append(p)
+        else:
+            print(f"error  {dump._clip(str(p), 4096)}: {'not a regular file' if p.exists() else 'no such file'}", file=sys.stderr)
+            status = 1
+    for f in files:
+        rows = dump.dump_file(f)
+        width = min(max((len(name) for _, name, _ in rows), default=0), 34)
+        print(f"== {dump._clip(str(f), 4096)}")
+        section = None
+        for sec, name, value in rows:
+            if sec != section:
+                section = sec
+                print(f"[{sec}]")
+            print(f"  {name:<{width}}  {value}")
+        print()
+    return status
 
 
 def _main(args, report: Report) -> int:

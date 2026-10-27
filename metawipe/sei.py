@@ -17,6 +17,7 @@ from bisect import bisect_right
 from pathlib import Path
 
 from .common import Context, WipeError
+from .common import boxes as _boxes
 
 _AVC = {b"avc1", b"avc3", b"dva1", b"dvav"}  # dva1/dvav: Dolby Vision on an H.264 base layer
 _HEVC = {b"hvc1", b"hev1", b"dvh1", b"dvhe"}
@@ -28,24 +29,6 @@ _VISUAL_ENTRY = 78  # SampleEntry + VisualSampleEntry fields before the child bo
 
 class _Malformed(Exception):
     pass
-
-
-def _boxes(buf, start: int, end: int):
-    """Yield (type, box_start, payload_start, box_end) for the boxes in buf[start:end]."""
-    pos = start
-    while pos + 8 <= end:
-        size = int.from_bytes(buf[pos:pos + 4], "big")
-        btype = bytes(buf[pos + 4:pos + 8])
-        header = 8
-        if size == 1:
-            size = int.from_bytes(buf[pos + 8:pos + 16], "big")
-            header = 16
-        elif size == 0:
-            size = end - pos
-        if size < header or pos + size > end:
-            raise WipeError("corrupt video: bad box size")
-        yield btype, pos, pos + header, pos + size
-        pos += size
 
 
 def _file_boxes(f, file_size: int):
