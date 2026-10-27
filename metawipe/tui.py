@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 
@@ -25,6 +26,34 @@ INK, SLATE, PANEL, PAPER = "#17202b", "#1e2937", "#263446", "#e6e9ee"
 STEEL, CORAL, AMBER, SEA, MUTED = "#7aa2d6", "#e8766c", "#e3b23c", "#62b7a0", "#8696aa"
 THEME = Theme(name="metawipe", primary=STEEL, secondary="#8c8fd6", warning=AMBER, error=CORAL, success=SEA, accent=AMBER,
               foreground=PAPER, background=INK, surface=SLATE, panel=PANEL, dark=True)
+
+DEFAULT_THEME = "metawipe"
+
+
+def config_path() -> Path:
+    """$XDG_CONFIG_HOME/metawipe/config.json (default ~/.config/metawipe/config.json)."""
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return Path(base) / "metawipe" / "config.json"
+
+
+def load_config() -> dict:
+    """Saved settings; a missing or broken file means defaults."""
+    try:
+        data = json.loads(config_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_config(**changes) -> None:
+    """Merge changes into the config file (atomic replace, keeps keys it does not know)."""
+    path = config_path()
+    data = {**load_config(), **changes}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
 
 _WHERE_OR_WHO = ("gps", "location", "coordinates", "author", "creator", "artist", "owner", "company", "manager", "people", "printer", "signature")
 _DEVICE = ("make", "model", "lens", "serial", "software", "host", "application", "makernote", "xmp", "iptc", "photoshop",
@@ -115,7 +144,9 @@ HELP = """[b]metawipe[/b] - removes identifying metadata (location, device, auth
   a  mark all supported files in this folder      c  clear all marks
   r  clean everything marked (marks clear)        f  toggle full scrub
   v  preview: switch between "what it reveals" and [b]everything[/b] the file carries (scrolls; sections in blue)
+  F5  reload the file tree (also happens after every run)
   F1 or ?  this help                              q  quit            Tab  jump between tree and options
+  Ctrl+P  command palette: "Change theme" - the chosen theme is remembered in ~/.config/metawipe/config.json
 
 [b]Options[/b]
   [b]Full scrub (--full)[/b]  on: also anonymise authors/dates of comments and tracked changes, clean pictures embedded in
@@ -195,6 +226,7 @@ class MetawipeApp(App):
         Binding("r", "run", "Run"),
         Binding("f", "toggle_full", "Full scrub"),
         Binding("v", "toggle_view", "Everything"),
+        Binding("f5", "reload_tree", "Reload"),
         Binding("f1,question_mark", "help", "Help"),
         Binding("q", "quit", "Quit"),
     ]
@@ -233,7 +265,10 @@ class MetawipeApp(App):
 
     def on_mount(self) -> None:
         self.register_theme(THEME)
-        self.theme = "metawipe"
+        self._saved_theme = load_config().get("theme", DEFAULT_THEME)
+        known = isinstance(self._saved_theme, str) and self._saved_theme in self.available_themes
+        self.theme = self._saved_theme if known else DEFAULT_THEME
+        self.theme_changed_signal.subscribe(self, self._remember_theme)
         self.query_one("#left").border_title = Text(str(self.start))
         table = self.query_one("#preview", DataTable)
         table.add_column("found", width=26)
@@ -260,6 +295,20 @@ class MetawipeApp(App):
         if invalidate is not None:
             invalidate()
         tree.refresh()
+
+    def action_reload_tree(self) -> None:
+        """Re-read the folders from disk: new copies, output folders and outside changes show up (open folders stay open)."""
+        self.query_one("#tree", MarkTree).reload()
+
+    def _remember_theme(self, theme: Theme) -> None:
+        if theme.name == self._saved_theme:
+            return
+        try:
+            save_config(theme=theme.name)
+        except OSError as e:
+            self.notify(f"Could not save the theme to {config_path()}: {e}", severity="warning", markup=False)
+            return
+        self._saved_theme = theme.name
 
     # ------------------------------------------------------------------ marking
     def _marks_changed(self) -> None:
@@ -452,6 +501,7 @@ class MetawipeApp(App):
     def _run_finished(self, args: argparse.Namespace) -> None:
         self.marks.difference_update(map(Path, args.paths))  # the outcome now shows in the tree; marks made during the run stay
         self._marks_changed()
+        self.action_reload_tree()  # the run made new files/folders (NAME.clean.EXT, the output folder)
 
 
 def run(start: str | os.PathLike | None = None) -> int:
