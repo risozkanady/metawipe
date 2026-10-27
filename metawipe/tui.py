@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 
 from rich.text import Text
@@ -13,7 +14,9 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.theme import Theme
-from textual.widgets import Button, DataTable, DirectoryTree, Footer, Header, Input, Label, RichLog, Select, Static, Switch
+from textual.widgets import Button, DataTable, DirectoryTree, Footer, Header, Input, Label, OptionList, RichLog, Select, Static, Switch
+from textual.widgets._header import HeaderClock, HeaderClockSpace
+from textual.widgets.option_list import Option
 
 from . import __version__, cli, peek
 from .common import WipeError
@@ -27,6 +30,14 @@ THEME = Theme(name="metawipe", primary=STEEL, secondary="#8c8fd6", warning=AMBER
               foreground=PAPER, background=INK, surface=SLATE, panel=PANEL, dark=True)
 
 DEFAULT_THEME = "metawipe"
+# the settings window (s), like Claude Code's /config: key -> (label, choices); the first choice is the default
+SETTINGS = {
+    "clock": ("Clock in the header", [("off", "off"), ("time", "time"), ("date", "date and time")]),
+    "show_hidden": ("Hidden files in the tree", [(False, "hidden"), (True, "shown")]),
+    "preview_everything": ("Preview starts with", [(False, "what a file reveals"), (True, "everything it carries")]),
+    "remember_options": ("Remember cleaning options", [(False, "no"), (True, "yes: output, folder, full scrub, replace")]),
+}
+CLOCK_FORMATS = {"time": "%H:%M:%S", "date": "%d.%m.%Y  %H:%M"}
 
 
 def config_path() -> Path:
@@ -77,13 +88,14 @@ class MarkTree(DirectoryTree):
     ICON_NODE, ICON_NODE_EXPANDED, ICON_FILE = "▸ ", "▾ ", "  "
     BINDINGS = [Binding("space", "app.toggle_mark", "Mark", show=False)]  # replaces Tree's own space binding
 
-    def __init__(self, path, marks: set, states: dict, **kw):
+    def __init__(self, path, marks: set, states: dict, show_hidden: bool = False, **kw):
         super().__init__(path, **kw)
         self.marks = marks
         self.states = states
+        self.show_hidden = show_hidden
 
     def filter_paths(self, paths):
-        return [p for p in paths if not p.name.startswith(".")]
+        return paths if self.show_hidden else [p for p in paths if not p.name.startswith(".")]
 
     def render_label(self, node, base_style, style):
         label = super().render_label(node, base_style, style)
@@ -129,6 +141,68 @@ class Confirm(ModalScreen[bool]):
         self.dismiss(value)
 
 
+class DateClock(HeaderClock):
+    """Textual's HeaderClock formats only the time of day: a date in its format would always read 01.01.1900."""
+
+    def render(self):
+        return Text(datetime.now().strftime(self.time_format))
+
+
+class ClockHeader(Header):
+    """Header whose clock can show the date too and be switched on and off while running."""
+
+    def compose(self) -> ComposeResult:
+        for widget in super().compose():
+            yield DateClock().data_bind(Header.time_format) if isinstance(widget, HeaderClockSpace) else widget
+
+
+class SettingsScreen(ModalScreen[None]):
+    """up/down picks a setting, Enter or space changes it; every change is applied and saved at once."""
+    BINDINGS = [Binding("escape,q,s", "close", "Close"), Binding("space", "change", "Change")]
+    DEFAULT_CSS = """
+    SettingsScreen { align: center middle; }
+    SettingsScreen > Vertical { width: 80; max-width: 96%; height: auto; border: thick $primary; background: $surface; padding: 1 2; }
+    SettingsScreen OptionList { height: auto; border: none; margin-bottom: 1; }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield OptionList(*self._rows())
+            yield Label(Text(f"Enter or space changes, Esc closes.\nSaved in {str(config_path()).replace(str(Path.home()), '~', 1)}",
+                             style="dim"))
+
+    def on_mount(self) -> None:
+        self.query_one(Vertical).border_title = "Settings"
+        self.query_one(OptionList).highlighted = 0
+        self.app.theme_changed_signal.subscribe(self, lambda _: self._refresh())
+
+    def _rows(self) -> list[Option]:
+        rows = [Option(Text(f"{'Theme':<28}{self.app.theme}   (Enter: pick)"), id="theme")]
+        return rows + [Option(Text(f"{label:<28}{dict(choices)[self.app.settings[key]]}"), id=key)
+                       for key, (label, choices) in SETTINGS.items()]
+
+    def _refresh(self) -> None:
+        options = self.query_one(OptionList)
+        for row in self._rows():
+            options.replace_option_prompt(row.id, row.prompt)
+
+    @on(OptionList.OptionSelected)
+    def change(self, event: OptionList.OptionSelected) -> None:
+        key = event.option.id
+        if key == "theme":
+            self.app.action_change_theme()  # Textual's own picker, previews as you move
+            return
+        values = [value for value, _ in SETTINGS[key][1]]
+        self.app.set_setting(key, values[(values.index(self.app.settings[key]) + 1) % len(values)])
+        self._refresh()
+
+    def action_change(self) -> None:
+        self.query_one(OptionList).action_select()
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 HELP = """[b]metawipe[/b] - removes identifying metadata (location, device, author, dates, ...) from files.
 
 [b]Screen[/b]
@@ -144,8 +218,8 @@ HELP = """[b]metawipe[/b] - removes identifying metadata (location, device, auth
   r  clean everything marked (marks clear)        f  toggle full scrub
   v  preview: switch between "what it reveals" and [b]everything[/b] the file carries (scrolls; sections in blue)
   F5  reload the file tree (also happens after every run)
+  s  settings: theme, clock/date, hidden files, preview mode, remember the options (saved in ~/.config/metawipe/config.json)
   F1 or ?  this help                              q  quit            Tab  jump between tree and options
-  Ctrl+P  command palette: "Change theme" - the chosen theme is remembered in ~/.config/metawipe/config.json
 
 [b]Options[/b]
   [b]Full scrub (--full)[/b]  on: also anonymise authors/dates of comments and tracked changes, clean pictures embedded in
@@ -226,6 +300,7 @@ class MetawipeApp(App):
         Binding("f", "toggle_full", "Full scrub"),
         Binding("v", "toggle_view", "Everything"),
         Binding("f5", "reload_tree", "Reload"),
+        Binding("s", "settings", "Settings"),
         Binding("f1,question_mark", "help", "Help"),
         Binding("q", "quit", "Quit"),
     ]
@@ -236,14 +311,17 @@ class MetawipeApp(App):
         self.start = Path(start or Path.cwd()).expanduser().resolve()
         self.marks: set[Path] = set()
         self.highlighted: Path | None = None
-        self.view_all = False  # preview: what the file reveals (summary) or every metadata entry it carries
+        self.config = load_config()
+        self.settings = {key: self.config[key] if self.config.get(key) in [v for v, _ in choices] else choices[0][0]
+                         for key, (_, choices) in SETTINGS.items()}
+        self.view_all = self.settings["preview_everything"]  # preview: what the file reveals or every metadata entry
         self.states: dict[Path, str] = {}  # outcome of the last run per file: done / incomplete / failed
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=False)
+        yield ClockHeader()
         with Horizontal():
             with Vertical(id="left"):
-                yield MarkTree(self.start, self.marks, self.states, id="tree")
+                yield MarkTree(self.start, self.marks, self.states, self.settings["show_hidden"], id="tree")
             with Vertical(id="right"):
                 yield DataTable(id="preview", cursor_type="none", show_header=False)
                 with Vertical(id="opts"):
@@ -265,7 +343,7 @@ class MetawipeApp(App):
 
     def on_mount(self) -> None:
         self.register_theme(THEME)
-        self._saved_theme = load_config().get("theme", DEFAULT_THEME)
+        self._saved_theme = self.config.get("theme", DEFAULT_THEME)
         known = isinstance(self._saved_theme, str) and self._saved_theme in self.available_themes
         self.theme = self._saved_theme if known else DEFAULT_THEME
         self.theme_changed_signal.subscribe(self, self._remember_theme)
@@ -276,6 +354,9 @@ class MetawipeApp(App):
         table.border_title = "What a file reveals"
         self.query_one("#log").border_title = "Results"
         self.query_one("#tree").focus()
+        self._apply_setting("clock")
+        if self.settings["remember_options"]:
+            self._restore_options(self.config.get("options"))
         self._sync_run_button()
         self.log_line("Mark files with [b]space[/] or [b]m[/] and press [b]r[/]. Folders are cleaned recursively. [b]F1[/] explains everything here.")
 
@@ -302,15 +383,60 @@ class MetawipeApp(App):
         """Re-read the folders from disk: new copies, output folders and outside changes show up (open folders stay open)."""
         self.query_one("#tree", MarkTree).reload()
 
-    def _remember_theme(self, theme: Theme) -> None:
-        if theme.name == self._saved_theme:
-            return
+    def _save(self, **changes) -> bool:
         try:
-            save_config(theme=theme.name)
+            save_config(**changes)
         except OSError as e:
-            self.notify(f"Could not save the theme to {config_path()}: {e}", severity="warning", markup=False)
+            self.notify(f"Could not save the settings to {config_path()}: {e}", severity="warning", markup=False)
+            return False
+        return True
+
+    def _remember_theme(self, theme: Theme) -> None:
+        if theme.name != self._saved_theme and self._save(theme=theme.name):
+            self._saved_theme = theme.name
+
+    # ------------------------------------------------------------------ settings
+    def action_settings(self) -> None:
+        self.push_screen(SettingsScreen())
+
+    def set_setting(self, key: str, value) -> None:
+        self.settings[key] = value
+        self._save(**{key: value})
+        self._apply_setting(key)
+
+    def _apply_setting(self, key: str) -> None:
+        value = self.settings[key]
+        if key == "clock":
+            self.query_one(DateClock).display = value != "off"
+            if value != "off":
+                self.query_one(ClockHeader).time_format = CLOCK_FORMATS[value]
+                self.query_one(DateClock).styles.width = len(datetime.now().strftime(CLOCK_FORMATS[value])) + 2  # Textual's is 10
+        elif key == "show_hidden":
+            self.query_one("#tree", MarkTree).show_hidden = value
+            self.action_reload_tree()
+        elif key == "preview_everything":
+            if self.view_all != value:
+                self.action_toggle_view()
+        elif key == "remember_options" and value:
+            self._options_changed()
+
+    def _restore_options(self, saved) -> None:
+        if not isinstance(saved, dict):
             return
-        self._saved_theme = theme.name
+        if saved.get("mode") in [v for _, v in MODES]:
+            self.query_one("#mode", Select).value = saved["mode"]
+        if isinstance(saved.get("outdir"), str):
+            self.query_one("#outdir", Input).value = saved["outdir"]
+        for key in ("full", "force"):
+            if isinstance(saved.get(key), bool):
+                self.query_one(f"#{key}", Switch).value = saved[key]
+
+    @on(Input.Changed, "#outdir")
+    @on(Switch.Changed)
+    def _options_changed(self) -> None:
+        if self.settings["remember_options"]:
+            self._save(options={"mode": self.query_one("#mode", Select).value, "outdir": self.query_one("#outdir", Input).value,
+                                "full": self.query_one("#full", Switch).value, "force": self.query_one("#force", Switch).value})
 
     # ------------------------------------------------------------------ marking
     def _marks_changed(self) -> None:
@@ -330,6 +456,7 @@ class MetawipeApp(App):
     def mode_changed(self) -> None:
         self.query_one("#folder-row").display = self.query_one("#mode", Select).value == "folder"
         self._sync_run_button()
+        self._options_changed()
 
     def _current_path(self) -> Path | None:
         node = self.query_one("#tree", MarkTree).cursor_node

@@ -37,7 +37,8 @@ Videos need `ffmpeg` (with `ffprobe`) on the PATH (`brew install ffmpeg`, `pacma
 For the interactive TUI (`metawipe --tui`) install with `pip install '.[tui]'`.
 In the TUI, `v` switches the preview between what the file reveals and everything it carries.
 The file tree reloads after every run (and on `F5`), so new `NAME.clean.EXT` copies and output folders show up.
-A theme picked with `Ctrl+P` → "Change theme" is remembered in `~/.config/metawipe/config.json` (`$XDG_CONFIG_HOME` is respected).
+`s` opens the settings (theme, clock with date, hidden files, preview mode, remember the cleaning options); every change
+is saved at once in `~/.config/metawipe/config.json` (`$XDG_CONFIG_HOME` is respected).
 
 ## Usage
 
