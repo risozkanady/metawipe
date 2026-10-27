@@ -120,4 +120,4 @@ python -m unittest discover -s tests -t . -v
 ```
 
 Tests that need `ffmpeg`, `heif-enc` or `exiv2` are skipped when those tools are missing.
-Tested on Linux with Python 3.14.
+Tested on Linux with Python 3.14. macOS and Windows should work (pure Python) but are untested.

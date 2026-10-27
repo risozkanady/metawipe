@@ -1,6 +1,8 @@
 """Shared helpers for the metawipe handlers."""
 from __future__ import annotations
 
+import contextlib
+import logging
 import struct
 import sys
 from dataclasses import dataclass, field
@@ -22,6 +24,18 @@ class Context:
         """Something identifying that this run could not remove (full mode reports the file as incomplete)."""
         self.residue.append(msg)
         self.warn(msg)
+
+
+@contextlib.contextmanager
+def quiet_pypdf():
+    """pypdf logs its recovery from damaged files to stderr; failures are reported by us instead."""
+    logger = logging.getLogger("pypdf")
+    old = logger.level
+    logger.setLevel(logging.CRITICAL)
+    try:
+        yield
+    finally:
+        logger.setLevel(old)
 
 
 def boxes(buf, start: int, end: int):

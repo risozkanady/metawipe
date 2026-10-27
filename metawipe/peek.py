@@ -14,7 +14,7 @@ import zipfile
 from pathlib import Path
 
 from . import dump, images, isobmff, office, video
-from .common import WipeError
+from .common import WipeError, quiet_pypdf
 
 _EXIF_NAMES = {
     270: "ImageDescription", 271: "Make", 272: "Model", 305: "Software", 306: "DateTime", 315: "Artist",
@@ -212,6 +212,7 @@ def _heif(data: bytes) -> list[tuple[str, str]]:
     return out
 
 
+@quiet_pypdf()
 def _pdf(path: Path) -> list[tuple[str, str]]:
     from pypdf import PdfReader
 
