@@ -212,7 +212,9 @@ def _os_error_for(e: OSError, tmp: Path, dst: Path) -> OSError:
     first, second = (_hide_temp(str(n), tmp, dst) if n is not None else None for n in (e.filename, e.filename2))
     if second == first:
         second = None
-    new = type(e)(e.errno, e.strerror, first, None, second)
+    new = type(e)(e.errno, e.strerror, first)  # not the 5-argument form: Windows prints its None as "[WinError None]"
+    if second is not None:
+        new.filename2 = second
     new.__cause__ = e
     return new
 

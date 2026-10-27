@@ -48,6 +48,7 @@ class CliTests(Base):
             cli.execute(cli.Job(src, self.dir / "a.clean.png", False), args)
         self.assertTrue(fsync.called)
 
+    @unittest.skipIf(os.name == "nt", "control characters are not allowed in Windows file names")
     def test_show_header_has_no_terminal_escapes(self):
         f = self.dir / "a\x1b[8m.png"
         f.write_bytes(png_bytes([(b"tEXt", b"k\x00x")]))
@@ -113,9 +114,24 @@ class TuiTests(Base):
             app.marks.add(self.dir / "[draft]")
             await pilot.press("r")
             self.assertTrue(await until(pilot, lambda: run_over(app)))
-            self.assertIn("[draft]/[/x]/a.png -> [draft]/[/x]/a.clean.png", log_text(app).replace("\n", ""))
+            self.assertIn("[draft]/[/x]/a.png -> [draft]/[/x]/a.clean.png".replace("/", os.sep), log_text(app).replace("\n", ""))
         self.run_app(self.dir, scenario)
         self.assertTrue((d / "a.clean.png").exists())
+
+    @unittest.skipIf(os.name == "nt", "a backslash in a name is a separator on Windows")
+    def test_backslash_before_bracket_is_logged_literally(self):
+        """Windows paths put a backslash before every folder name: rich's escape() lost it before a "[" that does not
+        start a tag (C:\\x\\[1]). Here (POSIX) a folder simply named "\\[1]" shows the same."""
+        d = self.dir / "\\[1]"
+        d.mkdir()
+        (d / "a.png").write_bytes(png_bytes([(b"tEXt", b"k\x00x")]))
+
+        async def scenario(app, pilot):
+            app.marks.add(d)
+            await pilot.press("r")
+            self.assertTrue(await until(pilot, lambda: run_over(app)))
+            self.assertIn("\\[1]/a.png -> \\[1]/a.clean.png", log_text(app).replace("\n", ""))
+        self.run_app(self.dir, scenario)
 
     def test_markup_in_a_docx_member_name_does_not_kill_the_run(self):
         with zipfile.ZipFile(self.dir / "a.docx", "w") as z:
@@ -231,10 +247,11 @@ class TuiTests(Base):
             app.marks.add(a)
             await pilot.press("r")
             self.assertTrue(await until(pilot, lambda: run_over(app)))
-            self.assertIn("already exists", log_text(app))
+            self.assertIn("already exists", log_text(app).replace("\n", " "))  # long (Windows) paths wrap the line
             self.assertEqual(app.states.get(a), "failed")
         self.run_app(self.dir, scenario)
 
+    @unittest.skipIf(os.name == "nt", "Windows expands ~name to a folder next to the home folder, whoever exists")
     def test_unknown_user_in_output_folder_does_not_crash(self):
         (self.dir / "a.png").write_bytes(png_bytes([(b"tEXt", b"k\x00x")]))
         old = os.getcwd()

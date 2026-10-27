@@ -6,7 +6,6 @@ import json
 import os
 from pathlib import Path
 
-from rich.markup import escape
 from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
@@ -195,11 +194,11 @@ class TuiReport(cli.Report):
     def fail(self, path, msg: str) -> None:
         self.failed += 1
         self.mark_failed(Path(path))
-        self.emit(f"[red]error[/]  {escape(str(path))}: {escape(msg)}")
+        self.emit(Text.assemble(("error", "red"), f"  {path}: {msg}"))
 
     def skip(self, path, why: str) -> None:
         self.skipped += 1
-        self.emit(f"[dim]skip   {escape(str(path))} ({escape(why)})[/]")
+        self.emit(Text(f"skip   {path} ({why})", style="dim"))
 
 
 class MetawipeApp(App):
@@ -281,7 +280,9 @@ class MetawipeApp(App):
         self.log_line("Mark files with [b]space[/] or [b]m[/] and press [b]r[/]. Folders are cleaned recursively. [b]F1[/] explains everything here.")
 
     # ------------------------------------------------------------------ helpers
-    def log_line(self, text: str) -> None:
+    def log_line(self, text: str | Text) -> None:
+        """str: our own words with markup; anything from the disk (paths, metadata, errors) goes in as Text, never parsed
+        (rich.markup.escape is not enough: a Windows path like C:\\x\\[1] loses its backslash)."""
         self.query_one("#log", RichLog).write(text)
 
     def _short(self, path: Path) -> str:
@@ -350,7 +351,7 @@ class MetawipeApp(App):
         found = [p for p in sorted(folder.iterdir()) if p.is_file() and cli.HANDLERS.get(p.suffix.lower())]
         self.marks.update(found)
         self._marks_changed()
-        self.log_line(f"marked {len(found)} supported file(s) in {escape(str(folder))}")
+        self.log_line(Text(f"marked {len(found)} supported file(s) in {folder}"))
 
     def action_clear_marks(self) -> None:
         self.marks.clear()
@@ -475,7 +476,7 @@ class MetawipeApp(App):
         incomplete = 0
         for job in jobs:
             try:
-                ctx = cli.execute(job, args, warn=lambda msg, j=job: emit(f"[yellow]warn[/]   {escape(j.src.name)}: {escape(msg)}"))
+                ctx = cli.execute(job, args, warn=lambda msg, j=job: emit(Text.assemble(("warn", "yellow"), f"   {j.src.name}: {msg}")))
             except WipeError as e:
                 report.fail(job.src, str(e))
                 continue
@@ -489,10 +490,11 @@ class MetawipeApp(App):
             if args.full and ctx.residue:
                 incomplete += 1
                 self.call_from_thread(self.states.__setitem__, job.src, "incomplete")
-                note = f" [yellow](INCOMPLETE: {len(ctx.residue)} item(s) left)[/]"
-            emit(f"[green]clean[/]  {escape(self._short(job.src))} -> {'in place' if job.inplace else escape(self._short(job.dst))}{note}")
+                note = f" (INCOMPLETE: {len(ctx.residue)} item(s) left)"
+            emit(Text.assemble(("clean", "green"), f"  {self._short(job.src)} -> {'in place' if job.inplace else self._short(job.dst)}",
+                               (note, "yellow")))
             if left:
-                emit("        still carries: " + ", ".join(escape(k) for k, _ in left[:6]) + (" ..." if len(left) > 6 else ""))
+                emit(Text("        still carries: " + ", ".join(k for k, _ in left[:6]) + (" ..." if len(left) > 6 else "")))
         emit(f"[b]done:[/] {report.cleaned} cleaned, {report.failed} failed, {report.skipped} skipped" + (f", {incomplete} incomplete" if args.full else ""))
         self.call_from_thread(self._run_finished, args)
         if self.highlighted is not None:

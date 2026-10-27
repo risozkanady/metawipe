@@ -392,6 +392,7 @@ class CliRegression(Base):
         self.assertFalse((self.dir / "o").exists())
         self.assertNotIn(".metawipe-", err)
 
+    @unittest.skipIf(os.name == "nt", "SIGTERM kills a Windows process outright")
     def test_sigterm_removes_temp_files(self):
         p = self.dir / "big.png"
         self.png(p)
