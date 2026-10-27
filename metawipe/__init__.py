@@ -1,2 +1,2 @@
 """metawipe - strip metadata from images, videos, PDFs and Office/OpenDocument files."""
-__version__ = "0.3.1b2"
+__version__ = "0.3.1b3"
